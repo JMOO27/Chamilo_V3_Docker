@@ -1,0 +1,40 @@
+
+services:
+  chamilo:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./chamilo:/var/www/chamilo
+      - ./php-custom.ini:/usr/local/etc/php/conf.d/99-custom.ini:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - lms_network
+
+  db:
+    image: mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: chamilo
+      MARIADB_USER: chamilo
+      MARIADB_PASSWORD: ${DATABASE_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${DATABASE_ROOT_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - lms_network
+
+networks:
+  lms_network:
+    driver: bridge
+
+volumes:
+  db_data:
