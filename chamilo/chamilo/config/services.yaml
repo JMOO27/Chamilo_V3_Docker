@@ -1,0 +1,307 @@
+# Put parameters here that don't need to change on each machine where the app is deployed
+# https://symfony.com/doc/current/best_practices/configuration.html#application-related-configuration
+parameters:
+    app_env: '%env(APP_ENV)%'
+    password_encryption: '%env(APP_ENCRYPT_METHOD)%'
+    secret: '%env(APP_SECRET)%'
+    locale: '%env(APP_LOCALE)%'
+    installed: '%env(APP_INSTALLED)%'
+    db_manager_enabled: '%env(bool:DB_MANAGER_ENABLED)%'
+    software_name: '%env(SOFTWARE_NAME)%'
+    software_url: '%env(SOFTWARE_URL)%'
+    deny_delete_users: '%env(bool:DENY_DELETE_USERS)%'
+    hosting_total_size_limit: '%env(int:HOSTING_TOTAL_SIZE_LIMIT)%'
+    theme_fallback: '%env(THEME_FALLBACK)%'
+    packager: '%env(PACKAGER)%'
+    default_template: '%env(DEFAULT_TEMPLATE)%'
+    scim_token: '%env(SCIM_TOKEN)%'
+    # Whether CsrfProtectionListener rejects requests that fail CSRF validation.
+    # On by default, so an installation that never updates its .env is still
+    # protected. Set CHAMILO_CSRF_ENFORCE=false to drop back to log-only mode,
+    # where the listener records what it would have rejected instead of
+    # answering 403 -- useful to find clients that write with a session cookie
+    # but send no Origin before enforcing on them.
+    env(CHAMILO_CSRF_ENFORCE): '1'
+    chamilo.csrf.enforce: '%env(bool:CHAMILO_CSRF_ENFORCE)%'
+    # The kernel resolves trusted_proxies on every boot, so a checkout with no
+    # .env yet (a fresh clone running composer install) fails without this
+    # default. Empty means "trust no proxy".
+    env(TRUSTED_PROXIES): ''
+    .container.dumper.inline_factories: true
+    twig:
+        form:
+            resources:
+                - 'GeneratorBundle::fields.html.twig'
+    course_info_is_not_editable: false
+
+    #    router.request_context.base_url: '%env(APP_URL_APPEND)%'
+    #    asset.request_context.base_path: '%env(APP_URL_APPEND)%'
+
+    # See https://glide.thephpleague.com/2.0/api/quick-reference/
+    glide_media_filters:
+        editor_thumbnail:
+            w: 64
+            h: 64
+        user_picture_small:
+            w: 48
+            h: 48
+        user_picture_profile:
+            w: 94
+            h: 94
+        course_picture_small:
+            w: 85
+            h: 47
+        course_picture_medium:
+            w: 400
+            h: 225
+        resource_show_preview:
+            w: 500
+
+services:
+    # default configuration for services in *this* file
+    _defaults:
+        autowire: true      # Automatically injects dependencies in your services.
+        autoconfigure: true # Automatically registers your services as commands, event subscribers, etc.
+        public: true       # Allows optimizing the container by removing unused services; this also means
+        # fetching services directly from the container via $container->get() won't work.
+        # The best practice is to be explicit about your dependencies anyway.
+
+    Vich\UploaderBundle\Naming\SubdirDirectoryNamer:
+        public: true
+
+    Symfony\Component\Mailer\Mailer:
+        public: true
+
+    Doctrine\ORM\EntityManager: "@doctrine.orm.default_entity_manager"
+
+    Symfony\Component\Security\Csrf\CsrfTokenManagerInterface:
+        alias: security.csrf.token_manager
+        public: true
+
+    Chamilo\CoreBundle\EventSubscriber\TranslatorFallbackLocaleSubscriber:
+      arguments:
+        $translator: '@translator.default'
+        $languageRepository: '@Chamilo\CoreBundle\Repository\LanguageRepository'
+      tags:
+        - { name: kernel.event_subscriber }
+
+    stof_doctrine_extensions.tool.locale_synchronizer:
+        class: Stof\DoctrineExtensionsBundle\Tool\LocaleSynchronizer
+        arguments:
+            $listener: '@stof_doctrine_extensions.listener.translatable'
+        public: true
+
+    Chamilo\CoreBundle\EventSubscriber\LoginFailureSubscriber:
+        tags:
+            - name: kernel.event_subscriber
+              dispatcher: security.event_dispatcher.main
+
+    Chamilo\CoreBundle\Serializer\UserSerializerContextBuilder:
+        decorates: api_platform.serializer.context_builder
+        arguments:
+            - '@.inner'
+            - '@security.helper'
+
+    Chamilo\CoreBundle\State\CStudentPublicationPostStateProcessor:
+        bind:
+            $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+
+    Chamilo\CoreBundle\State\CCalendarEventStateProcessor:
+        arguments:
+            $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+        tags:
+            - { name: 'api_platform.state_processor' }
+
+    Chamilo\CoreBundle\State\UsergroupPostStateProcessor:
+      arguments:
+        $processor: '@api_platform.doctrine.orm.state.persist_processor'
+        $entityManager: '@doctrine.orm.entity_manager'
+        $security: '@security.helper'
+        $requestStack: '@request_stack'
+      tags:
+        - { name: 'api_platform.state_processor' }
+
+    Chamilo\CoreBundle\State\CAttendanceStateProcessor:
+      arguments:
+        $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+        $entityManager: '@doctrine.orm.entity_manager'
+        $calendarRepo: '@Chamilo\CourseBundle\Repository\CAttendanceCalendarRepository'
+        $requestStack: '@request_stack'
+      tags:
+        - { name: 'api_platform.state_processor' }
+
+    Chamilo\CoreBundle\State\ColorThemeStateProcessor:
+      bind:
+        $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+
+    Chamilo\CoreBundle\State\CourseRelUserStateProcessor:
+      bind:
+        $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+
+    Chamilo\CoreBundle\State\UserRelUserStateProcessor:
+      bind:
+        $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+        $removeProcessor: '@api_platform.doctrine.orm.state.remove_processor'
+
+    Chamilo\CoreBundle\State\MessageProcessor:
+        bind:
+            $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+            $removeProcessor: '@api_platform.doctrine.orm.state.remove_processor'
+
+    Chamilo\CoreBundle\Push\FcmV1MobilePushProvider:
+        tags:
+            - { name: 'chamilo.mobile_push_provider' }
+
+    Chamilo\CoreBundle\State\CBlogAssignAuthorProcessor:
+      arguments:
+        $persistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+        $security: '@security.helper'
+      tags:
+        - { name: 'api_platform.state_processor' }
+
+    Chamilo\CoreBundle\EventSubscriber\RememberMeSubscriber:
+      arguments:
+        $appSecret: '%kernel.secret%'
+      tags: [ 'kernel.event_subscriber' ]
+
+    Chamilo\CoreBundle\Security\Authenticator\RememberMeCookieAuthenticator:
+      arguments:
+        $appSecret: '%env(APP_SECRET)%'
+
+    Chamilo\CoreBundle\EventSubscriber\AnonymousUserSubscriber:
+      tags:
+        - name: kernel.event_subscriber
+
+    Chamilo\CoreBundle\Security\Authorization\Voter\AnonymousVoter:
+      tags:
+        - name: security.voter
+
+    Chamilo\CoreBundle\EventSubscriber\InstallDbGuardSubscriber:
+      arguments:
+        $connection: '@doctrine.dbal.default_connection'
+      tags:
+        - { name: kernel.event_subscriber }
+
+    Chamilo\CoreBundle\Helpers\ContainerHelper:
+        calls:
+            - setAuthorizationChecker: [ '@security.authorization_checker' ]
+            - setTokenStorage: [ '@security.token_storage' ]
+            - setKernel: [ '@kernel' ]
+            - setMessengerBus: [ '@messenger.bus.default' ]
+            - setValidator: [ '@validator' ]
+            - setSessionFactory: [ '@session.factory' ]
+
+    Chamilo\CoreBundle\Helpers\PluginEntityLoaderHelper:
+        arguments:
+            $pluginDir: '%kernel.project_dir%/public/plugin'
+
+    League\Flysystem\AwsS3V3\PortableVisibilityConverter: ~
+
+    chamilo.storage.awss3_client:
+        class: Aws\S3\S3Client
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AwsS3ClientFactory', 'create']
+        arguments:
+            - '%env(AWS_S3_STORAGE_VERSION)%'
+            - '%env(AWS_S3_STORAGE_REGION)%'
+            - '%env(AWS_S3_STORAGE_ACCESS_KEY)%'
+            - '%env(AWS_S3_STORAGE_ACCESS_SECRET)%'
+            - '%env(default::AWS_S3_STORAGE_ENDPOINT)%'
+            - '%env(default::AWS_S3_USE_PATH_STYLE)%'
+
+    Google\Cloud\Storage\StorageClient:
+        arguments:
+            $config:
+                projectId: '%env(GOOGLE_STORAGE_CLOUD_PROJECT_ID)%'
+                keyFilePath: '%env(resolve:GOOGLE_STORAGE_KEY_FILE_PATH)%'
+
+    AzureOss\Storage\Blob\BlobServiceClient:
+        factory: ['AzureOss\Storage\Blob\BlobServiceClient', 'fromConnectionString']
+        arguments:
+            - '%env(AZURE_STORAGE_CONNECTION_STRING)%'
+
+    chamilo.storage.azure_asset_adapter:
+        class: AzureOss\Storage\BlobFlysystem\AzureBlobStorageAdapter
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AzureBlobAdapterFactory', 'create']
+        arguments:
+            - '@AzureOss\Storage\Blob\BlobServiceClient'
+            - '%env(AZURE_STORAGE_ASSET_CONTAINER)%'
+            - '%env(AZURE_STORAGE_ASSET_PREFIX)%'
+
+    chamilo.storage.azure_asset_cache_adapter:
+        class: AzureOss\Storage\BlobFlysystem\AzureBlobStorageAdapter
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AzureBlobAdapterFactory', 'create']
+        arguments:
+            - '@AzureOss\Storage\Blob\BlobServiceClient'
+            - '%env(AZURE_STORAGE_ASSET_CACHE_CONTAINER)%'
+            - '%env(AZURE_STORAGE_ASSET_CACHE_PREFIX)%'
+
+    chamilo.storage.azure_resource_adapter:
+        class: AzureOss\Storage\BlobFlysystem\AzureBlobStorageAdapter
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AzureBlobAdapterFactory', 'create']
+        arguments:
+            - '@AzureOss\Storage\Blob\BlobServiceClient'
+            - '%env(AZURE_STORAGE_RESOURCE_CONTAINER)%'
+            - '%env(AZURE_STORAGE_RESOURCE_PREFIX)%'
+
+    chamilo.storage.azure_resource_cache_adapter:
+        class: AzureOss\Storage\BlobFlysystem\AzureBlobStorageAdapter
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AzureBlobAdapterFactory', 'create']
+        arguments:
+            - '@AzureOss\Storage\Blob\BlobServiceClient'
+            - '%env(AZURE_STORAGE_RESOURCE_CACHE_CONTAINER)%'
+            - '%env(AZURE_STORAGE_RESOURCE_CACHE_PREFIX)%'
+
+    chamilo.storage.azure_themes_adapter:
+        class: AzureOss\Storage\BlobFlysystem\AzureBlobStorageAdapter
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AzureBlobAdapterFactory', 'create']
+        arguments:
+            - '@AzureOss\Storage\Blob\BlobServiceClient'
+            - '%env(AZURE_STORAGE_THEMES_CONTAINER)%'
+            - '%env(AZURE_STORAGE_THEMES_PREFIX)%'
+
+    chamilo.storage.azure_plugins_adapter:
+        class: AzureOss\Storage\BlobFlysystem\AzureBlobStorageAdapter
+        factory: ['Chamilo\CoreBundle\Storage\Factory\AzureBlobAdapterFactory', 'create']
+        arguments:
+            - '@AzureOss\Storage\Blob\BlobServiceClient'
+            - '%env(AZURE_STORAGE_PLUGINS_CONTAINER)%'
+            - '%env(AZURE_STORAGE_PLUGINS_PREFIX)%'
+
+    # Template for the `api` firewall's JWT authenticator (see security.yaml,
+    # `api.jwt.authenticator`) — same 5 arguments as Lexik's own abstract
+    # `lexik_jwt_authentication.security.jwt_authenticator` template (index 3, the
+    # user provider, is left unset here; Lexik's own JWTAuthenticatorFactory fills it
+    # in per-firewall via replaceArgument(3, ...)), just backed by a subclass that
+    # narrows supports() to actual JWT-shaped tokens. See StrictJwtAuthenticator's
+    # docblock for why.
+    chamilo.security.strict_jwt_authenticator:
+        class: Chamilo\CoreBundle\Security\Authenticator\StrictJwtAuthenticator
+        abstract: true
+        arguments:
+            - '@lexik_jwt_authentication.jwt_manager'
+            - '@event_dispatcher'
+            - '@lexik_jwt_authentication.extractor.chain_extractor'
+            - ~
+            - '@?translator'
+
+    Chamilo\CoreBundle\Security\Authenticator\Ldap\ExtAdapter: ~
+
+    Symfony\Component\Ldap\Ldap:
+        arguments: [ '@Chamilo\CoreBundle\Security\Authenticator\Ldap\ExtAdapter' ]
+        tags:
+            - ldap
+
+    Symfony\Component\Ldap\Security\CheckLdapCredentialsListener:
+        arguments: [ '@security.ldap_locator' ]
+        tags:
+            - { name: kernel.event_subscriber, dispatcher: security.event_dispatcher.main }
+
+cocur_slugify:
+    lowercase: true
+
+imports:
+    - { resource: ../src/CoreBundle/Resources/config/services.yml }
+    - { resource: ../src/LtiBundle/Resources/config/services.yml }
+    - { resource: ./authentication.yaml, ignore_errors: not_found }
+    - { resource: ./settings_overrides.yaml, ignore_errors: not_found }
+    - { resource: ./plugin.yaml, ignore_errors: not_found }

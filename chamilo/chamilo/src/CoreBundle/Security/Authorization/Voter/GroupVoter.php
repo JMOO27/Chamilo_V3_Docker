@@ -1,0 +1,194 @@
+<?php
+
+declare(strict_types=1);
+
+/* For licensing terms, see /license.txt */
+
+namespace Chamilo\CoreBundle\Security\Authorization\Voter;
+
+use Chamilo\CoreBundle\Entity\Course;
+use Chamilo\CoreBundle\Entity\User;
+use Chamilo\CoreBundle\Repository\Node\CourseRepository;
+use Chamilo\CourseBundle\Entity\CGroup;
+use Chamilo\CourseBundle\Repository\CGroupRepository;
+use Doctrine\ORM\EntityManager;
+use GroupManager;
+use Symfony\Component\HttpFoundation\RequestStack;
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\AccessDecisionManagerInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\Vote;
+use Symfony\Component\Security\Core\Authorization\Voter\Voter;
+use Symfony\Component\Security\Core\User\UserInterface;
+
+/**
+ * @extends Voter<'VIEW'|'EDIT'|'DELETE', CGroup>
+ */
+class GroupVoter extends Voter
+{
+    public const string VIEW = 'VIEW';
+    public const string EDIT = 'EDIT';
+    public const string DELETE = 'DELETE';
+
+    private AccessDecisionManagerInterface $accessDecisionManager;
+    private RequestStack $requestStack;
+
+    public function __construct(
+        // EntityManager $entityManager,
+        // CourseRepository $courseManager,
+        // CGroupRepository $groupManager,
+        RequestStack $requestStack,
+        AccessDecisionManagerInterface $accessDecisionManager
+    ) {
+        // $this->entityManager = $entityManager;
+        // $this->courseManager = $courseManager;
+        // $this->groupManager = $groupManager;
+        $this->accessDecisionManager = $accessDecisionManager;
+        $this->requestStack = $requestStack;
+    }
+
+    protected function supports(string $attribute, $subject): bool
+    {
+        $options = [
+            self::VIEW,
+            self::EDIT,
+            self::DELETE,
+        ];
+
+        return $subject instanceof CGroup && \in_array($attribute, $options, true);
+    }
+
+    protected function voteOnAttribute(string $attribute, $subject, TokenInterface $token, ?Vote $vote = null): bool
+    {
+        /** @var User $user */
+        $user = $token->getUser();
+
+        // make sure there is a user object (i.e. that the user is logged in)
+        if (!$user instanceof UserInterface) {
+            return false;
+        }
+
+        if (false === $subject) {
+            return false;
+        }
+
+        // Admins have access to everything.
+        if ($this->accessDecisionManager->decide($token, ['ROLE_ADMIN'])) {
+            return true;
+        }
+
+        /** @var CGroup $group */
+        $group = $subject;
+
+        // The group's parent is the course.
+        /** @var Course $course */
+        $course = $group->getParent();
+
+        if ($course->isHidden()) {
+            return false;
+        }
+
+        if (Course::REGISTERED === $course->getVisibility()) {
+            if (!$course->hasSubscriptionByUser($user)) {
+                return false;
+            }
+        }
+
+        if ($course->hasUserAsTeacher($user)) {
+            return true;
+        }
+
+        // Legacy
+        // \GroupManager::userHasAccessToBrowse($user->getId(), $group);
+        $isTutor = $group->hasTutor($user);
+
+        switch ($attribute) {
+            case self::VIEW:
+                if ($isTutor) {
+                    return true;
+                }
+
+                if (!$group->getStatus()) {
+                    return false;
+                }
+
+                $userIsInGroup = $group->hasMember($user);
+
+                $requestUri = '';
+                // Check if user has access in legacy tool.
+                $request = $this->requestStack->getCurrentRequest();
+                if ($request) {
+                    $requestUri = $request->getRequestUri();
+                }
+
+                // Every tool needs BOTH of its paths listed: the legacy page and the Vue
+                // route it was migrated to. $toolStatus below defaults to TOOL_PUBLIC, so a
+                // path that matches nothing grants access — a tool listed only under /main/
+                // stops being checked at all once its callers move to /resources/. The wiki
+                // was the only one carrying both; the other five were added here for the
+                // same reason.
+                $tools = [
+                    '/main/forum/' => $group->getForumState(),
+                    '/resources/forum/' => $group->getForumState(),
+                    '/documents/' => $group->getDocState(),
+                    '/resources/document/' => $group->getDocState(),
+                    '/main/calendar/' => $group->getCalendarState(),
+                    '/resources/ccalendarevent' => $group->getCalendarState(),
+                    '/main/announcements/' => $group->getAnnouncementsState(),
+                    '/resources/announcement/' => $group->getAnnouncementsState(),
+                    '/main/work/' => $group->getWorkState(),
+                    '/resources/assignment/' => $group->getWorkState(),
+                    '/resources/wiki/' => $group->getWikiState(),
+                    '/main/wiki/' => $group->getWikiState(),
+                    /*'/main/group/group_space' => GroupManager::TOOL_PUBLIC,
+                    '/main/inc/ajax/model.ajax.php' => GroupManager::TOOL_PUBLIC,
+                    '/main/inc/ajax/announcement.ajax.php' => GroupManager::TOOL_PUBLIC,*/
+                    // '/main/chat/' => $group->getAnnouncementsState(),  ??
+                ];
+
+                $toolStatus = GroupManager::TOOL_PUBLIC;
+                foreach ($tools as $path => $status) {
+                    if (str_contains($requestUri, $path)) {
+                        $toolStatus = $status;
+
+                        break;
+                    }
+                }
+
+                switch ($toolStatus) {
+                    case GroupManager::TOOL_NOT_AVAILABLE:
+                        return false;
+
+                    case GroupManager::TOOL_PUBLIC:
+                        return true;
+
+                    case GroupManager::TOOL_PRIVATE:
+                        if ($userIsInGroup) {
+                            return true;
+                        }
+
+                        break;
+
+                    case GroupManager::TOOL_PRIVATE_BETWEEN_USERS:
+                        // Only works for announcements for now
+                        if ($userIsInGroup && '/main/announcements/' === $path) {
+                            return true;
+                        }
+
+                        break;
+                }
+
+                break;
+
+            case self::EDIT:
+            case self::DELETE:
+                if ($isTutor) {
+                    return true;
+                }
+
+                break;
+        }
+        // dump("You don't have access to this group!!");
+
+        return false;
+    }
+}

@@ -1,0 +1,56 @@
+build:
+    environment:
+        php: 8.1.2
+
+    nodes:
+        analysis:
+            project_setup:
+                override: true
+            tests:
+                override: [php-scrutinizer-run]
+    tests:
+        override:
+            command: "php -v"
+    dependencies:
+        override:
+            - "php -v"
+
+checks:
+    php: true
+
+filter:
+    excluded_paths:
+        - 'assets/*'
+        - 'bin/*'
+        - 'config/*'
+        - 'public/documentation/*'
+        - 'public/main/admin/ldap_synchro.php'
+        - 'public/main/chat/emoji_strategy.php'
+        - 'public/main/inc/lib/javascript/*'
+        - 'public/main/inc/lib/kses-0.2.2/*'
+        - 'public/main/inc/lib/nusoap/*'
+        - 'public/main/inc/lib/opengraph/*'
+        - 'public/main/inc/lib/ppt2png/*'
+        - 'public/main/inc/lib/pear/*'
+        - 'public/main/inc/lib/xajax/*'
+        - 'public/main/lp/packaging/*'
+        - 'public/main/template/*'
+        - 'public/main/lang/*'
+        - 'public/plugin/BuyCourses/src/Culqi/*'
+        - 'public/plugin/BuyCourses/src/Requests/*'
+        - 'public/plugin/BuyCourses/src/paypalfunctions.php'
+        - 'public/plugin/BuyCourses/src/Requests.php'
+        - 'public/plugin/vchamilo/cli/*'
+        - 'public/plugin/Pens/lib/'
+        - 'public/plugin/Bbb/lib/bbb_api.php'
+        - 'public/plugin/ImsLti/OAuthSimple.php'
+        - 'public/plugin/sepe/src/wsse/*'
+        - 'public/plugin/Test2Pdf/class/*'
+        - 'public/plugin/jcapture/lib/*'
+        - 'public/plugin/jcapture/src/*'
+        - 'tests/*'
+        - 'var/cache/*'
+        - 'var/log/*'
+        - 'vendor/*'
+        - 'public/libs/*'
+        - 'public/img/*'

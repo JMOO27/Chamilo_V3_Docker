@@ -1,0 +1,317 @@
+<template>
+  <div v-if="!isLoading && item && canEditItem">
+    <Toolbar
+      :handle-back="handleBack"
+      :handle-reset="resetForm"
+    />
+    <div class="documents-layout">
+      <div class="template-list-container">
+        <TemplateList
+          :templates="templates"
+          @template-selected="addTemplateToEditor"
+        />
+      </div>
+      <div class="documents-form-container">
+        <DocumentsForm
+          ref="updateForm"
+          :errors="violations"
+          :search-enabled="isSearchEnabled && !isCertificateDocument"
+          :values="item"
+          @submit="onSendFormData"
+        >
+          <div
+            v-if="isCurrentTeacher"
+            class="mb-3 flex items-center gap-2"
+          >
+            <BaseCheckbox
+              id="ai-assisted-flag"
+              v-model="aiAssistedFlag"
+              :label="$t('AI-assisted')"
+              name="ai_assisted"
+            />
+
+            <span
+              class="mdi mdi-information-outline cursor-help text-primary"
+              role="img"
+              tabindex="0"
+              :aria-label="$t('Information about AI-assisted documents')"
+              :title="
+                $t(
+                  'Marks this document as AI-assisted. Use it when the content was created or significantly modified with AI tools.',
+                )
+              "
+            />
+          </div>
+
+          <div class="mt-4">
+            <EditLinks
+              v-model="item"
+              :show-share-with-user="false"
+              :show-status="false"
+              links-type="users"
+            />
+          </div>
+        </DocumentsForm>
+
+        <Panel
+          v-if="filetype === 'certificate'"
+          :header="$t('Certificate tags')"
+          class="mt-4"
+        >
+          <div class="flex items-start justify-between gap-3 mb-3">
+            <p class="text-sm text-gray-600">
+              {{
+                $t(
+                  "Click a tag to insert it into the editor. These placeholders will be replaced when generating the certificate.",
+                )
+              }}
+            </p>
+
+            <button
+              class="shrink-0 px-3 py-2 rounded-lg border border-gray-25 hover:bg-gray-10 text-sm font-medium"
+              type="button"
+              @click="copyAllCertificateTags"
+            >
+              {{ $t("Copy all") }}
+            </button>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+            <button
+              v-for="tag in certificateTags"
+              :key="tag"
+              :title="$t('Click to insert')"
+              class="text-left px-3 py-2 rounded-lg border border-gray-25 hover:border-gray-20 hover:bg-gray-10"
+              type="button"
+              @click="insertCertificateTag(tag)"
+            >
+              <code class="text-sm">{{ tag }}</code>
+            </button>
+          </div>
+        </Panel>
+      </div>
+    </div>
+
+    <Loading :visible="isLoading" />
+  </div>
+</template>
+
+<script setup>
+import { computed, onMounted, ref, watch } from "vue"
+import { useRoute, useRouter } from "vue-router"
+import { usePlatformConfig } from "../../store/platformConfig"
+import { useSecurityStore } from "../../store/securityStore"
+import { useIsAllowedToEdit } from "../../composables/userPermissions"
+import { useDocumentUpdate } from "../../composables/useDocumentUpdate"
+import { useCertificateTags } from "../../composables/useCertificateTags"
+import { useDocumentTemplates } from "../../composables/useDocumentTemplates"
+import { looksLikeHtmlContent } from "../../composables/fileUtils"
+import DocumentsForm from "../../components/documents/FormNewDocument.vue"
+import Loading from "../../components/Loading.vue"
+import Toolbar from "../../components/Toolbar.vue"
+import EditLinks from "../../components/resource_links/EditLinks.vue"
+import TemplateList from "../../components/documents/TemplateList.vue"
+import BaseCheckbox from "../../components/basecomponents/BaseCheckbox.vue"
+import Panel from "primevue/panel"
+
+const route = useRoute()
+const router = useRouter()
+const securityStore = useSecurityStore()
+const platformConfigStore = usePlatformConfig()
+
+const { isAllowedToEdit } = useIsAllowedToEdit({ tutor: true, coach: true, sessionCoach: true })
+const {
+  item,
+  isLoading,
+  updated,
+  violations,
+  retrieve,
+  onSendFormData: dispatchSendFormData,
+  resetForm: dispatchResetForm,
+} = useDocumentUpdate()
+
+const updateForm = ref(null)
+const aiAssistedFlag = ref(false)
+const hasReturnedToLearningPath = ref(false)
+
+const learningPathId = computed(() => Number(route.query.lp_id || 0))
+const isLearningPathContext = computed(
+  () => "learnpath" === String(route.query.origin || "").toLowerCase() && learningPathId.value > 0,
+)
+
+function buildLearningPathBuilderRoute() {
+  const query = { ...route.query }
+  delete query.action
+  delete query.create
+  delete query.content
+  delete query.lpItemId
+  delete query.id
+  delete query.filetype
+
+  return {
+    name: "LpBuilder",
+    params: {
+      node: Number(route.query.node || route.params.node || 0),
+      lpId: learningPathId.value,
+    },
+    query,
+  }
+}
+
+const isSearchEnabled = computed(() => "false" !== platformConfigStore.getSetting("search.search_enabled"))
+
+const allowedFiletypes = ["file", "certificate", "video"]
+const filetype = allowedFiletypes.includes(route.query.filetype) ? route.query.filetype : "file"
+const isCertificateDocument = computed(() =>
+  "certificate" === String(item.value?.filetype || filetype).trim().toLowerCase(),
+)
+
+const isEditableTextDocument = computed(() => {
+  const document = item.value
+  const documentFiletype = String(document?.filetype || filetype)
+    .trim()
+    .toLowerCase()
+
+  if (["certificate", "html"].includes(documentFiletype)) {
+    return true
+  }
+
+  if ("file" !== documentFiletype) {
+    return false
+  }
+
+  const resourceFile = document?.resourceNode?.firstResourceFile
+  if (!resourceFile) {
+    return false
+  }
+
+  const mime = String(resourceFile.mimeType || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase()
+  const originalName = String(resourceFile.originalName || resourceFile.title || document?.title || "")
+    .trim()
+    .toLowerCase()
+  const extension = originalName.includes(".") ? originalName.split(".").pop() : ""
+
+  if (mime.includes("text/html") || mime.includes("application/xhtml") || ["html", "htm", "xhtml"].includes(extension)) {
+    return true
+  }
+
+  if (resourceFile.image || resourceFile.video || resourceFile.audio) {
+    return false
+  }
+
+  if (mime.startsWith("image/") || mime.startsWith("video/") || mime.startsWith("audio/")) {
+    return false
+  }
+
+  return looksLikeHtmlContent(document?.contentFile)
+})
+
+const { certificateTags, insertCertificateTag, copyAllCertificateTags } = useCertificateTags(item)
+const { templates, fetchTemplates, addTemplateToEditor } = useDocumentTemplates(item, updateForm)
+
+const isCurrentTeacher = computed(() => securityStore.isCurrentTeacher || isAllowedToEdit.value)
+
+const canEditItem = computed(() => {
+  const resourceLink = item.value?.resourceLinkListFromEntity?.[0]
+  const sidFromResourceLink = resourceLink?.session?.["@id"]
+  const sid = String(route.query.sid ?? "0")
+
+  return (
+    (sidFromResourceLink && sidFromResourceLink === `/api/sessions/${sid}` && isAllowedToEdit.value) ||
+    isCurrentTeacher.value
+  )
+})
+
+watch(
+  item,
+  (val) => {
+    if (!val || typeof val !== "object" || 0 === Object.keys(val).length) return
+
+    if (!isEditableTextDocument.value) {
+      const query = { ...route.query }
+      delete query.getFile
+
+      router.replace({
+        name: "DocumentsUpdate",
+        params: { node: route.params.node },
+        query,
+      })
+      return
+    }
+
+    if ("certificate" === String(val.filetype || filetype).trim().toLowerCase()) {
+      val.indexDocumentContent = false
+      val.searchFieldValues = {}
+    }
+
+    const raw = val.ai_assisted_raw ?? val.ai_assisted
+    aiAssistedFlag.value = raw === true || raw === 1 || raw === "1"
+  },
+  { immediate: true },
+)
+
+watch(updated, (val) => {
+  if (!val) {
+    return
+  }
+
+  updateForm.value?.clearEditorDrafts?.()
+
+  if (isLearningPathContext.value && !hasReturnedToLearningPath.value) {
+    hasReturnedToLearningPath.value = true
+    router.push(buildLearningPathBuilderRoute())
+  }
+})
+
+onMounted(() => {
+  fetchTemplates()
+  retrieve()
+
+  if (item.value && typeof item.value === "object" && !item.value.searchFieldValues) {
+    item.value.searchFieldValues = {}
+  }
+})
+
+function handleBack() {
+  if (isLearningPathContext.value) {
+    return router.push(buildLearningPathBuilderRoute())
+  }
+
+  return router.back()
+}
+
+function normalizeBoolean(value) {
+  const v = String(value ?? "")
+    .trim()
+    .toLowerCase()
+
+  return ["1", "true", "yes", "on"].includes(v)
+}
+
+function normalizeAiAssistedState() {
+  const currentRaw = item.value?.ai_assisted_raw
+  const current = item.value?.ai_assisted
+  const enabled = aiAssistedFlag.value || normalizeBoolean(currentRaw) || normalizeBoolean(current)
+
+  item.value.ai_assisted = enabled ? 1 : 0
+  item.value.ai_assisted_raw = enabled ? 1 : 0
+  aiAssistedFlag.value = enabled
+}
+
+function onSendFormData() {
+  if (isCertificateDocument.value) {
+    item.value.indexDocumentContent = false
+    item.value.searchFieldValues = {}
+  }
+
+  normalizeAiAssistedState()
+  dispatchSendFormData(updateForm.value)
+}
+
+function resetForm() {
+  dispatchResetForm(updateForm.value)
+}
+</script>

@@ -1,0 +1,2123 @@
+<?php
+
+/* For licensing terms, see /license.txt */
+
+declare(strict_types=1);
+
+namespace Chamilo\CoreBundle\Controller;
+
+use Chamilo\CoreBundle\Entity\AbstractResource;
+use Chamilo\CoreBundle\Entity\Course;
+use Chamilo\CoreBundle\Entity\CourseRelUser;
+use Chamilo\CoreBundle\Entity\ExtraField;
+use Chamilo\CoreBundle\Entity\ResourceLink;
+use Chamilo\CoreBundle\Entity\SequenceResource;
+use Chamilo\CoreBundle\Entity\Session;
+use Chamilo\CoreBundle\Entity\SessionRelUser;
+use Chamilo\CoreBundle\Entity\Tag;
+use Chamilo\CoreBundle\Entity\Tool;
+use Chamilo\CoreBundle\Entity\User;
+use Chamilo\CoreBundle\Framework\Container;
+use Chamilo\CoreBundle\Helpers\AccessUrlHelper;
+use Chamilo\CoreBundle\Helpers\CidReqHelper;
+use Chamilo\CoreBundle\Helpers\CourseHelper;
+use Chamilo\CoreBundle\Helpers\CourseStudentInfoHelper;
+use Chamilo\CoreBundle\Helpers\UserHelper;
+use Chamilo\CoreBundle\Repository\AssetRepository;
+use Chamilo\CoreBundle\Repository\ExtraFieldValuesRepository;
+use Chamilo\CoreBundle\Repository\LanguageRepository;
+use Chamilo\CoreBundle\Repository\LegalRepository;
+use Chamilo\CoreBundle\Repository\Node\CourseRepository;
+use Chamilo\CoreBundle\Repository\Node\IllustrationRepository;
+use Chamilo\CoreBundle\Repository\SequenceResourceRepository;
+use Chamilo\CoreBundle\Repository\TagRepository;
+use Chamilo\CoreBundle\Security\Authorization\Voter\CourseVoter;
+use Chamilo\CoreBundle\Security\CourseAccessResolver;
+use Chamilo\CoreBundle\Service\LearningPath\LearningPathAccessChecker;
+use Chamilo\CoreBundle\Settings\SettingsManager;
+use Chamilo\CoreBundle\Tool\ToolChain;
+use Chamilo\CourseBundle\Controller\ToolBaseController;
+use Chamilo\CourseBundle\Entity\CBlog;
+use Chamilo\CourseBundle\Entity\CCourseDescription;
+use Chamilo\CourseBundle\Entity\CLink;
+use Chamilo\CourseBundle\Entity\CLp;
+use Chamilo\CourseBundle\Entity\CLpCategory;
+use Chamilo\CourseBundle\Entity\CShortcut;
+use Chamilo\CourseBundle\Entity\CThematicAdvance;
+use Chamilo\CourseBundle\Entity\CTool;
+use Chamilo\CourseBundle\Repository\CCourseDescriptionRepository;
+use Chamilo\CourseBundle\Repository\CLpRepository;
+use Chamilo\CourseBundle\Repository\CQuizRepository;
+use Chamilo\CourseBundle\Repository\CShortcutRepository;
+use Chamilo\CourseBundle\Repository\CThematicRepository;
+use Chamilo\CourseBundle\Repository\CToolRepository;
+use Chamilo\CourseBundle\Settings\SettingsCourseManager;
+use Chamilo\CourseBundle\Settings\SettingsFormFactory;
+use Chamilo\LtiBundle\Entity\ExternalTool;
+use CourseManager;
+use DateTimeInterface;
+use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
+use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\Persistence\ManagerRegistry;
+use Event;
+use Exercise;
+use ExtraFieldValue;
+use Graphp\GraphViz\GraphViz;
+use IntlDateFormatter;
+use InvalidArgumentException;
+use RuntimeException;
+use Symfony\Bridge\Doctrine\Attribute\MapEntity;
+use Symfony\Bundle\SecurityBundle\Security;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+use Symfony\Component\Routing\Attribute\Route;
+use Symfony\Component\Security\Http\Attribute\IsGranted;
+use Symfony\Component\Serializer\SerializerInterface;
+use Symfony\Component\Validator\Exception\ValidatorException;
+use Symfony\Contracts\Translation\TranslatorInterface;
+use Throwable;
+use UserManager;
+
+use const ENT_QUOTES;
+use const ENT_SUBSTITUTE;
+use const PHP_QUERY_RFC3986;
+
+/**
+ * @author Julio Montoya <gugli100@gmail.com>
+ */
+#[Route('/course')]
+class CourseController extends ToolBaseController
+{
+    public function __construct(
+        private readonly EntityManagerInterface $em,
+        private readonly SerializerInterface $serializer,
+        private readonly UserHelper $userHelper,
+        private readonly ManagerRegistry $doctrine,
+    ) {}
+
+    /**
+     * Extend the controller service locator to include "doctrine".
+     * This prevents runtime errors when legacy code tries to access it through the controller container.
+     */
+    public static function getSubscribedServices(): array
+    {
+        return array_merge(parent::getSubscribedServices(), [
+            'doctrine' => ManagerRegistry::class,
+        ]);
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/{cid}/checkLegal.json', name: 'chamilo_core_course_check_legal_json')]
+    public function checkTermsAndConditionJson(
+        Request $request,
+        LegalRepository $legalTermsRepo,
+        LanguageRepository $languageRepository,
+        ExtraFieldValuesRepository $extraFieldValuesRepository,
+        SettingsManager $settingsManager,
+        CourseAccessResolver $courseAccessResolver,
+    ): Response {
+        $user = $this->userHelper->getCurrent();
+        $course = $this->getCourse();
+        $sid = $this->getSessionId();
+
+        $responseData = [
+            'redirect' => false,
+            'url' => '#',
+        ];
+
+        if (null !== $course) {
+            $coursePasswordAccepted = true === (bool) $request->getSession()->get(
+                'course_password_'.$course->getId(),
+                false
+            );
+            $session = $sid > 0 ? $this->em->find(Session::class, $sid) : null;
+
+            if (!$coursePasswordAccepted
+                && $courseAccessResolver->requiresRegistrationPassword($course, $user, $session)
+            ) {
+                return new JsonResponse([
+                    'redirect' => true,
+                    'url' => '/main/auth/set_temp_password.php?'.http_build_query([
+                        'course_id' => $course->getId(),
+                        'session_id' => $sid,
+                    ]),
+                ]);
+            }
+        }
+
+        if ($user->isStudent()
+            && 'true' === $settingsManager->getSetting('registration.allow_terms_conditions', true)
+            && 'course' === $settingsManager->getSetting('workflows.load_term_conditions_section', true)
+        ) {
+            $termAndConditionStatus = false;
+            $extraValue = $extraFieldValuesRepository->findLegalAcceptByItemId($user->getId());
+            if (!empty($extraValue['value'])) {
+                $result = $extraValue['value'];
+                $userConditions = explode(':', $result);
+                $version = $userConditions[0];
+                $langId = (int) $userConditions[1];
+                $realVersion = $legalTermsRepo->getLastVersion($langId);
+                $termAndConditionStatus = ($version >= $realVersion);
+            }
+
+            if (false === $termAndConditionStatus) {
+                $request->getSession()->set('term_and_condition', ['user_id' => $user->getId()]);
+
+                $redirect = true;
+
+                if ('true' === $settingsManager->getSetting('course.allow_public_course_with_no_terms_conditions', true)
+                    && Course::OPEN_WORLD === $course->getVisibility()
+                ) {
+                    $redirect = false;
+                }
+
+                if ($redirect && !$this->isGranted('ROLE_ADMIN')) {
+                    $request->getSession()->remove('cid');
+                    $request->getSession()->remove('course');
+
+                    // Build return URL
+                    $returnUrl = '/course/'.$course->getId().'/home?sid='.$sid;
+
+                    $responseData = [
+                        'redirect' => true,
+                        'url' => '/main/auth/tc.php?return='.urlencode($returnUrl),
+                    ];
+                }
+            } else {
+                $request->getSession()->remove('term_and_condition');
+            }
+        }
+
+        return new JsonResponse($responseData);
+    }
+
+    #[Route('/{cid}/home.json', name: 'chamilo_core_course_home_json')]
+    public function indexJson(
+        Request $request,
+        CShortcutRepository $shortcutRepository,
+        EntityManagerInterface $em,
+        AssetRepository $assetRepository,
+        SettingsManager $settingsManager,
+        LearningPathAccessChecker $learningPathAccessChecker,
+    ): Response {
+        // Handle drag & drop sort for course tools
+        if ($request->isMethod('POST')) {
+            $requestData = json_decode($request->getContent() ?: '', true) ?? [];
+
+            if (isset($requestData['toolId'], $requestData['index'])) {
+                $course = $this->getCourse();
+                if (null === $course) {
+                    return $this->json(
+                        ['success' => false, 'message' => 'Course not found.'],
+                        Response::HTTP_BAD_REQUEST
+                    );
+                }
+
+                // Reordering the course home is a teacher action: the drag &
+                // drop handle is only rendered when api_is_allowed_to_edit()
+                // grants it. Without this check the POST branch returns before
+                // reaching the GET flow's access check below, so any
+                // authenticated user could reorder any course's tools.
+                $this->denyAccessUnlessGranted(CourseVoter::EDIT, $course);
+
+                $sessionId = $this->getSessionId();
+                $toolId = (int) $requestData['toolId'];
+                $newIndex = (int) $requestData['index'];
+
+                $result = $this->reorderCourseTools($em, $course, $sessionId, $toolId, $newIndex);
+                $statusCode = $result['success'] ? Response::HTTP_OK : Response::HTTP_BAD_REQUEST;
+
+                return $this->json($result, $statusCode);
+            }
+        }
+
+        $course = $this->getCourse();
+        $sessionId = $this->getSessionId();
+        $isInASession = $sessionId > 0;
+
+        if (null === $course) {
+            throw $this->createAccessDeniedException();
+        }
+
+        if (empty($sessionId)) {
+            $this->denyAccessUnlessGranted(CourseVoter::VIEW, $course);
+        }
+
+        $sessionHandler = $request->getSession();
+
+        $userId = 0;
+
+        $user = $this->userHelper->getCurrent();
+        if (null !== $user) {
+            $userId = $user->getId();
+        }
+
+        $session = $sessionId > 0 ? $em->getRepository(Session::class)->find($sessionId) : null;
+        $canManageShortcuts = null !== $user
+            && 'studentview' !== $sessionHandler->get('studentview')
+            && (
+                $user->isAdmin()
+                || $user->hasRole('ROLE_CURRENT_COURSE_TEACHER')
+                || $user->hasRole('ROLE_CURRENT_COURSE_SESSION_TEACHER')
+            );
+        $showInvisibleLearningPaths = $this->isTruthyCourseHomeSetting(
+            $settingsManager->getSetting('lp.show_invisible_lp_in_course_home', true),
+        );
+
+        $courseCode = $course->getCode();
+        $courseId = $course->getId();
+
+        if ($user && $user->isInvitee()) {
+            $isSubscribed = CourseManager::is_user_subscribed_in_course(
+                $userId,
+                $courseCode,
+                $isInASession,
+                $sessionId
+            );
+
+            if (!$isSubscribed) {
+                throw $this->createAccessDeniedException();
+            }
+        }
+
+        $isSpecialCourse = CourseManager::isSpecialCourse($courseId);
+
+        if ($user && $isSpecialCourse && (isset($_GET['autoreg']) && 1 === (int) $_GET['autoreg'])
+            && CourseManager::subscribeUser($userId, $courseId, STUDENT)
+        ) {
+            $sessionHandler->set('is_allowed_in_course', true);
+        }
+
+        $logInfo = [
+            'tool' => 'course-main',
+        ];
+        Event::registerLog($logInfo);
+
+        // Deleting the objects
+        $sessionHandler->remove('toolgroup');
+        $sessionHandler->remove('_gid');
+        $sessionHandler->remove('oLP');
+        $sessionHandler->remove('lpobject');
+
+        api_remove_in_gradebook();
+        Exercise::cleanSessionVariables();
+
+        $shortcuts = [];
+        if (null !== $user) {
+            $shortcutQuery = $shortcutRepository->getResourcesByCourse(
+                $course,
+                $session,
+                null,
+                $course->getResourceNode(),
+                false,
+                true,
+                true,
+            );
+            $shortcuts = $shortcutQuery->getQuery()->getResult();
+
+            $pluginEntity = Container::getPluginRepository()->findOneByTitle('ImsLti');
+            $currentAccessUrl = Container::getAccessUrlUtil()->getCurrent();
+            $pluginConfiguration = $pluginEntity?->getConfigurationsByAccessUrl($currentAccessUrl);
+
+            $isImsLtiEnabled = $pluginEntity
+                && $pluginEntity->isInstalled()
+                && $pluginConfiguration
+                && $pluginConfiguration->isActive();
+
+            $topLinksRelationClass = 'Chamilo\PluginBundle\TopLinks\Entity\TopLinkRelShortcut';
+            $topLinksEntityPath = \dirname(__DIR__, 3).'/public/plugin/TopLinks/src/Entity/TopLinkRelShortcut.php';
+            $topLinksRepositoryPath = \dirname(__DIR__, 3).'/public/plugin/TopLinks/src/Entity/Repository/TopLinkRelShortcutRepository.php';
+
+            if (is_file($topLinksRepositoryPath)) {
+                require_once $topLinksRepositoryPath;
+            }
+
+            if (is_file($topLinksEntityPath)) {
+                require_once $topLinksEntityPath;
+            }
+
+            $topLinksPluginEntity = Container::getPluginRepository()->findOneByTitle('TopLinks');
+            if (null === $topLinksPluginEntity) {
+                $topLinksPluginEntity = Container::getPluginRepository()->findOneByTitle('Top Links');
+            }
+
+            $topLinksConfiguration = $topLinksPluginEntity?->getConfigurationsByAccessUrl($currentAccessUrl);
+            $isTopLinksEnabled = $topLinksPluginEntity
+                && $topLinksPluginEntity->isInstalled()
+                && $topLinksConfiguration
+                && $topLinksConfiguration->isActive()
+                && class_exists($topLinksRelationClass);
+
+            if ($isTopLinksEnabled) {
+                try {
+                    $isTopLinksEnabled = $em
+                        ->getConnection()
+                        ->createSchemaManager()
+                        ->tablesExist(['toplinks_link_rel_shortcut'])
+                    ;
+                } catch (Throwable) {
+                    $isTopLinksEnabled = false;
+                }
+            }
+
+            $embedRegistryPluginEntity = Container::getPluginRepository()->findOneByTitle('EmbedRegistry');
+            $embedRegistryConfiguration = $embedRegistryPluginEntity?->getConfigurationsByAccessUrl($currentAccessUrl);
+            $isEmbedRegistryAvailable = false;
+
+            try {
+                $isEmbedRegistryAvailable = $em
+                    ->getConnection()
+                    ->createSchemaManager()
+                    ->tablesExist(['plugin_embed_registry_shortcut'])
+                ;
+            } catch (Throwable) {
+                $isEmbedRegistryAvailable = false;
+            }
+
+            $isEmbedRegistryEnabled = $embedRegistryPluginEntity
+                && $embedRegistryPluginEntity->isInstalled()
+                && $embedRegistryConfiguration
+                && $embedRegistryConfiguration->isActive()
+                && $isEmbedRegistryAvailable;
+
+            $courseNodeId = $course->getResourceNode()->getId();
+            $cid = $course->getId();
+            $sid = $this->getSessionId() ?: null;
+
+            $externalToolRepository = $em->getRepository(ExternalTool::class);
+            $learningPathRepository = $em->getRepository(CLp::class);
+            $learningPathCategoryRepository = $em->getRepository(CLpCategory::class);
+            $topLinksRelationRepository = $isTopLinksEnabled ? $em->getRepository($topLinksRelationClass) : null;
+            $visibleShortcuts = [];
+
+            /** @var CShortcut $shortcut */
+            foreach ($shortcuts as $shortcut) {
+                $resourceNode = $shortcut->getShortCutNode();
+
+                if (!$canManageShortcuts && !$this->isCourseHomeResourcePublished($shortcut, $course, $session)) {
+                    continue;
+                }
+
+                if (null !== $topLinksRelationRepository) {
+                    $topLinksRelation = $topLinksRelationRepository->findOneBy(['shortcut' => $shortcut]);
+
+                    if (null !== $topLinksRelation && method_exists($topLinksRelation, 'getLink')) {
+                        $topLink = $topLinksRelation->getLink();
+
+                        if (null !== $topLink && method_exists($topLink, 'getId')) {
+                            $queryParams = array_filter([
+                                'link' => $topLink->getId(),
+                                'cid' => $cid,
+                                'sid' => $sid ?: null,
+                                'gid' => 0,
+                            ], static fn ($value): bool => null !== $value);
+
+                            $shortcut->setUrlOverride('/plugin/TopLinks/start.php?'.http_build_query($queryParams));
+                            $shortcut->setIcon('mdi-link-variant');
+
+                            $iconName = method_exists($topLink, 'getIcon') ? $topLink->getIcon() : null;
+                            if (
+                                \is_string($iconName)
+                                && preg_match('/^[a-f0-9]{32}\.(?:png|jpe?g|gif|webp)$/i', $iconName)
+                            ) {
+                                $shortcut->setCustomImageUrl('/plugin/TopLinks/image.php?f='.rawurlencode($iconName));
+                            } else {
+                                $shortcut->setCustomImageUrl(null);
+                            }
+
+                            $target = method_exists($topLink, 'getTarget') ? (string) $topLink->getTarget() : '_blank';
+                            $shortcut->target = \in_array($target, ['_self', '_blank'], true) ? $target : '_blank';
+
+                            $visibleShortcuts[] = $shortcut;
+
+                            continue;
+                        }
+                    }
+                }
+
+                if ($isEmbedRegistryAvailable) {
+                    try {
+                        $embedRegistryShortcutId = (int) $em->getConnection()->fetchOne(
+                            'SELECT shortcut_id FROM plugin_embed_registry_shortcut WHERE shortcut_id = :shortcutId',
+                            ['shortcutId' => $shortcut->getId()]
+                        );
+                    } catch (Throwable) {
+                        $embedRegistryShortcutId = 0;
+                    }
+
+                    if ($embedRegistryShortcutId > 0) {
+                        if (!$isEmbedRegistryEnabled) {
+                            continue;
+                        }
+
+                        $queryParams = array_filter([
+                            'cid' => $cid,
+                            'sid' => $sid ?: null,
+                            'gid' => 0,
+                        ], static fn ($value): bool => null !== $value);
+
+                        $shortcut->setUrlOverride('/plugin/EmbedRegistry/start.php?'.http_build_query($queryParams));
+                        $shortcut->setIcon('mdi-application-brackets-outline');
+                        $shortcut->setCustomImageUrl(null);
+                        $shortcut->target = '_self';
+
+                        $visibleShortcuts[] = $shortcut;
+
+                        continue;
+                    }
+                }
+
+                /** @var ExternalTool|null $externalTool */
+                $externalTool = $externalToolRepository->findOneBy(['resourceNode' => $resourceNode]);
+                if ($externalTool) {
+                    if (!$isImsLtiEnabled) {
+                        continue;
+                    }
+
+                    $shortcut->setCustomImageUrl(null);
+                    $shortcut->setUrlOverride(null);
+                    $shortcut->setIcon(null);
+                    $shortcut->target = '_self';
+
+                    $visibleShortcuts[] = $shortcut;
+
+                    continue;
+                }
+
+                /** @var CLp|null $learningPath */
+                $learningPath = $learningPathRepository->findOneBy(['resourceNode' => $resourceNode]);
+                if ($learningPath) {
+                    if (!$canManageShortcuts
+                        && !$learningPathAccessChecker->isLearningPathVisibleOnCourseHome(
+                            $learningPath,
+                            $course,
+                            $session,
+                            $user,
+                            $showInvisibleLearningPaths,
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    $shortcut->setCustomImageUrl(null);
+                    $shortcut->setUrlOverride(null);
+                    $shortcut->setIcon(null);
+                    $shortcut->target = '_self';
+
+                    $visibleShortcuts[] = $shortcut;
+
+                    continue;
+                }
+
+                /** @var CLpCategory|null $learningPathCategory */
+                $learningPathCategory = $learningPathCategoryRepository->findOneBy(['resourceNode' => $resourceNode]);
+                if ($learningPathCategory) {
+                    if (!$canManageShortcuts
+                        && !$learningPathAccessChecker->isCategoryVisibleOnCourseHome(
+                            $learningPathCategory,
+                            $course,
+                            $session,
+                            $user,
+                            $showInvisibleLearningPaths,
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    $shortcut->setCustomImageUrl(null);
+                    $shortcut->setUrlOverride(null);
+                    $shortcut->setIcon(null);
+                    $shortcut->target = '_self';
+
+                    $visibleShortcuts[] = $shortcut;
+
+                    continue;
+                }
+
+                $cLink = $em->getRepository(CLink::class)->findOneBy(['resourceNode' => $resourceNode]);
+                if ($cLink) {
+                    if (!$canManageShortcuts && !$this->isCourseHomeResourcePublished($cLink, $course, $session)) {
+                        continue;
+                    }
+
+                    $shortcut->setCustomImageUrl(
+                        $cLink->getCustomImage()
+                            ? $assetRepository->getAssetUrl($cLink->getCustomImage())
+                            : null
+                    );
+
+                    $shortcut->setUrlOverride($cLink->getUrl());
+                    $shortcut->setIcon(null);
+                    $shortcut->target = $cLink->getTarget();
+
+                    $visibleShortcuts[] = $shortcut;
+
+                    continue;
+                }
+
+                $cBlog = $em->getRepository(CBlog::class)->findOneBy(['resourceNode' => $resourceNode]);
+                if ($cBlog) {
+                    $qs = http_build_query(array_filter([
+                        'cid' => $cid,
+                        'sid' => $sid ?: null,
+                        'gid' => 0,
+                    ], static fn ($value): bool => null !== $value));
+
+                    $shortcut->setUrlOverride(\sprintf(
+                        '/resources/blog/%d/%d/posts?%s',
+                        $courseNodeId,
+                        $cBlog->getIid(),
+                        $qs
+                    ));
+                    $shortcut->setIcon('mdi-notebook-outline');
+                    $shortcut->setCustomImageUrl(null);
+                    $shortcut->target = '_self';
+
+                    $visibleShortcuts[] = $shortcut;
+
+                    continue;
+                }
+
+                $shortcut->setCustomImageUrl(null);
+                $shortcut->setUrlOverride(null);
+                $shortcut->setIcon(null);
+                $shortcut->target = '_self';
+
+                $visibleShortcuts[] = $shortcut;
+            }
+
+            $shortcuts = $visibleShortcuts;
+        }
+
+        $responseData = [
+            'shortcuts' => $shortcuts,
+            'diagram' => '',
+        ];
+
+        $json = $this->serializer->serialize(
+            $responseData,
+            'json',
+            [
+                'groups' => ['course:read', 'ctool:read', 'tool:read', 'cshortcut:read'],
+            ]
+        );
+
+        return new Response(
+            $json,
+            Response::HTTP_OK,
+            [
+                'Content-type' => 'application/json',
+            ]
+        );
+    }
+
+    #[Route('/{cid}/thematic_progress.json', name: 'chamilo_core_course_thematic_progress_json', methods: ['GET'])]
+    public function thematicProgressJson(
+        Request $request,
+        CThematicRepository $thematicRepository,
+        UserHelper $userHelper,
+        CidReqHelper $cidReqHelper,
+        TranslatorInterface $translator,
+        SettingsCourseManager $courseSettingsManager
+    ): JsonResponse {
+        $course = $this->getCourse();
+        if (null === $course) {
+            throw $this->createAccessDeniedException();
+        }
+
+        if (0 === $this->getSessionId()) {
+            $this->denyAccessUnlessGranted(CourseVoter::VIEW, $course);
+        }
+
+        $courseSettingsManager->setCourse($course);
+        $displayMode = (string) $courseSettingsManager->getCourseSettingValue('display_info_advance_inside_homecourse');
+
+        if ('' === $displayMode || '0' === $displayMode || '4' === $displayMode) {
+            return new JsonResponse(['enabled' => false]);
+        }
+
+        $sessionEntity = $cidReqHelper->getSessionEntity();
+        $currentUser = $userHelper->getCurrent();
+
+        $advance1 = null;
+        $advance2 = null;
+        $subtitle1 = '';
+        $subtitle2 = '';
+
+        if ('1' === $displayMode) {
+            // Last completed topic only
+            $advance1 = $thematicRepository->findLastDoneAdvanceForCourse($course, $sessionEntity);
+            if (null !== $advance1) {
+                $subtitle1 = $translator->trans('Current topic');
+            }
+        } elseif ('2' === $displayMode) {
+            // Two next not done topics
+            $nextList = $thematicRepository->findNextNotDoneAdvancesForCourse($course, $sessionEntity, 2);
+
+            if (isset($nextList[0]) && $nextList[0] instanceof CThematicAdvance) {
+                $advance1 = $nextList[0];
+                $subtitle1 = $translator->trans('Next topic');
+            }
+
+            if (isset($nextList[1]) && $nextList[1] instanceof CThematicAdvance) {
+                $advance2 = $nextList[1];
+                $subtitle2 = $translator->trans('Next topic');
+            }
+        } elseif ('3' === $displayMode) {
+            // Current (last done) + next not done
+            $advance1 = $thematicRepository->findLastDoneAdvanceForCourse($course, $sessionEntity);
+            $nextList = $thematicRepository->findNextNotDoneAdvancesForCourse($course, $sessionEntity, 1);
+
+            if (null !== $advance1) {
+                $subtitle1 = $translator->trans('Current topic');
+            }
+
+            if (isset($nextList[0]) && $nextList[0] instanceof CThematicAdvance) {
+                $advance2 = $nextList[0];
+                $subtitle2 = $translator->trans('Next topic');
+            }
+        } else {
+            return new JsonResponse(['enabled' => false]);
+        }
+
+        if (null === $advance1 && null === $advance2) {
+            return new JsonResponse(['enabled' => false]);
+        }
+
+        $locale = $request->getLocale();
+        $timezoneId = null;
+
+        if ($currentUser && method_exists($currentUser, 'getTimezone') && $currentUser->getTimezone()) {
+            $timezoneId = $currentUser->getTimezone();
+        }
+
+        if (empty($timezoneId)) {
+            $timezoneId = date_default_timezone_get();
+        }
+
+        $dateFormatter = new IntlDateFormatter(
+            $locale,
+            IntlDateFormatter::MEDIUM,
+            IntlDateFormatter::SHORT,
+            $timezoneId
+        );
+
+        $buildItem = function (CThematicAdvance $advance, string $type, string $label) use ($dateFormatter): array {
+            $thematic = $advance->getThematic();
+
+            $startDate = $advance->getStartDate();
+            $formattedDate = $startDate instanceof DateTimeInterface
+                ? (string) $dateFormatter->format($startDate)
+                : '';
+
+            return [
+                'type' => $type,
+                'label' => $label,
+                'title' => strip_tags($thematic->getTitle() ?? ''),
+                'startDate' => $formattedDate,
+                'content' => strip_tags($advance->getContent() ?? ''),
+                'duration' => (float) $advance->getDuration(),
+            ];
+        };
+
+        $items = [];
+
+        if (null !== $advance1) {
+            $firstType = ('1' === $displayMode || '3' === $displayMode) ? 'current' : 'next';
+            $items[] = $buildItem($advance1, $firstType, $subtitle1);
+        }
+
+        if (null !== $advance2) {
+            $items[] = $buildItem($advance2, 'next', $subtitle2);
+        }
+
+        $userPayload = null;
+        if ($currentUser) {
+            $name = method_exists($currentUser, 'getCompleteName')
+                ? $currentUser->getCompleteName()
+                : trim(\sprintf('%s %s', $currentUser->getFirstname(), $currentUser->getLastname()));
+
+            $userPayload = [
+                'name' => $name,
+                'avatar' => null,
+            ];
+        }
+
+        $courseNodeId = (int) ($course->getResourceNode()?->getId() ?? 0);
+        $thematicUrl = null;
+
+        if ($courseNodeId > 0) {
+            $thematicUrl = '/resources/course-progress/'.$courseNodeId.'/?'.http_build_query([
+                'cid' => (int) $course->getId(),
+                'sid' => $this->getSessionId(),
+            ]);
+        }
+
+        $thematicScoreRaw = $thematicRepository->calculateTotalAverageForCourse($course, $sessionEntity);
+        $thematicScore = $thematicScoreRaw.'%';
+
+        $payload = [
+            'enabled' => true,
+            'displayMode' => (int) $displayMode,
+            'title' => $translator->trans('Thematic advance'),
+            'score' => $thematicScore,
+            'scoreRaw' => $thematicScoreRaw,
+            'user' => $userPayload,
+            'items' => $items,
+            'detailUrl' => $thematicUrl,
+            'labels' => [
+                'duration' => $translator->trans('Duration in hours'),
+                'seeDetail' => $translator->trans('See detail'),
+            ],
+        ];
+
+        return new JsonResponse($payload);
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/{courseId}/next-course', name: 'chamilo_course_next_course')]
+    public function getNextCourse(
+        int $courseId,
+        Request $request,
+        SequenceResourceRepository $repo,
+        Security $security,
+        SettingsManager $settingsManager,
+        EntityManagerInterface $em
+    ): JsonResponse {
+        $sessionId = $request->query->getInt('sid');
+        $useDependents = $request->query->getBoolean('dependents', false);
+        $user = $security->getUser();
+
+        if (null === $user || !method_exists($user, 'getId')) {
+            return new JsonResponse(['error' => 'Authentication required.'], Response::HTTP_UNAUTHORIZED);
+        }
+
+        $userId = $user->getId();
+
+        if ($useDependents) {
+            $sequences = $repo->getDependents($courseId, SequenceResource::COURSE_TYPE);
+            $checked = $repo->checkDependentsForUser($sequences, SequenceResource::COURSE_TYPE, $userId, $sessionId, $courseId);
+            $isUnlocked = $repo->checkSequenceAreCompleted($checked);
+            $sequenceResource = $repo->findRequirementForResource($courseId, SequenceResource::COURSE_TYPE);
+        } else {
+            $sequences = $repo->getRequirements($courseId, SequenceResource::COURSE_TYPE);
+
+            $hasValidRequirement = false;
+            foreach ($sequences as $sequence) {
+                foreach ($sequence['requirements'] ?? [] as $resource) {
+                    if ($resource instanceof Course) {
+                        $hasValidRequirement = true;
+
+                        break 2;
+                    }
+                }
+            }
+
+            if (!$hasValidRequirement) {
+                return new JsonResponse([]);
+            }
+
+            $checked = $repo->checkRequirementsForUser($sequences, SequenceResource::COURSE_TYPE, $userId, $sessionId);
+            $isUnlocked = $repo->checkSequenceAreCompleted($checked);
+            $sequenceResource = $repo->findRequirementForResource($courseId, SequenceResource::COURSE_TYPE);
+        }
+
+        $graphImage = null;
+
+        if ($sequenceResource && $sequenceResource->hasGraph()) {
+            $graph = $sequenceResource->getSequence()->getUnSerializeGraph();
+            if (null !== $graph) {
+                $graph->setAttribute('graphviz.node.fontname', 'arial');
+                $graphviz = new GraphViz();
+                $graphImage = $graphviz->createImageSrc($graph);
+            }
+        }
+
+        return new JsonResponse([
+            'sequenceList' => array_values($checked),
+            'allowSubscription' => $isUnlocked,
+            'graph' => $graphImage,
+        ]);
+    }
+
+    /**
+     * Redirects the page to a tool, following the tools settings.
+     */
+    #[Route('/{cid}/tool/{toolName}', name: 'chamilo_core_course_redirect_tool')]
+    public function redirectTool(
+        Request $request,
+        string $toolName,
+        CToolRepository $repo,
+        ToolChain $toolChain
+    ): RedirectResponse {
+        if (null === $this->getCourse()) {
+            throw new NotFoundHttpException($this->trans('Course not found'));
+        }
+
+        /** @var CTool|null $tool */
+        $tool = $repo->findOneBy([
+            'title' => $toolName,
+        ]);
+
+        if (null === $tool) {
+            throw new NotFoundHttpException($this->trans('Tool not found'));
+        }
+
+        $toolDefinition = $toolChain->getToolFromName($tool->getTool()->getTitle());
+        $link = $toolDefinition->getLink();
+
+        if ($this->isExerciseToolEntry($toolName, $tool->getTool()->getTitle(), $link)) {
+            $exerciseUrl = $this->buildExerciseVueToolUrl();
+            if (null !== $exerciseUrl) {
+                return $this->redirect($exerciseUrl);
+            }
+        }
+
+        $optionalParams = '';
+
+        $optionalParams = $request->query->get('cert') ? '&cert='.$request->query->get('cert') : '';
+
+        if (strpos($link, 'nodeId')) {
+            $nodeId = (string) $this->getCourse()->getResourceNode()->getId();
+            $link = str_replace(':nodeId', $nodeId, $link);
+        }
+
+        $url = $link.'?'.$this->getCourseUrlQuery().$optionalParams;
+
+        return $this->redirect($url);
+    }
+
+    /**
+     * Edit configuration with given namespace.
+     */
+    #[Route('/{course}/settings/{namespace}', name: 'chamilo_core_course_settings')]
+    public function updateSettings(
+        Request $request,
+        #[MapEntity(expr: 'repository.find(course)')]
+        Course $course,
+        string $namespace,
+        SettingsCourseManager $manager,
+        SettingsFormFactory $formFactory
+    ): Response {
+        // Course settings are teacher material: VIEW would let any enrolled student in.
+        $user = $this->userHelper->getCurrent();
+        $canManageSettings = $this->isGranted('ROLE_ADMIN')
+            || ($user instanceof User && (
+                $course->hasUserAsTeacher($user)
+                || $this->isGranted('ROLE_CURRENT_COURSE_TEACHER')
+            ));
+
+        if (!$canManageSettings) {
+            throw $this->createAccessDeniedException('You are not allowed to manage the course settings.');
+        }
+
+        $manager->setCourse($course);
+
+        if ('wiki' === $namespace) {
+            if ($request->isMethod(Request::METHOD_GET)) {
+                $nodeId = $course->getResourceNode()?->getId();
+                if (null !== $nodeId) {
+                    return $this->redirect(\sprintf(
+                        '/resources/wiki/%d/settings?cid=%d',
+                        $nodeId,
+                        $course->getId(),
+                    ));
+                }
+            }
+        }
+
+        $schemaAlias = $manager->convertNameSpaceToService($namespace);
+        $settings = $manager->load($namespace);
+
+        $form = $formFactory->create($schemaAlias);
+
+        $form->setData($settings);
+        $form->handleRequest($request);
+
+        if ($form->isSubmitted() && $form->isValid()) {
+            $messageType = 'success';
+
+            try {
+                $manager->save($form->getData());
+                $message = $this->trans('Update');
+            } catch (ValidatorException $validatorException) {
+                $message = $this->trans($validatorException->getMessage());
+                $messageType = 'error';
+            }
+            $this->addFlash($messageType, $message);
+
+            if ($request->headers->has('referer')) {
+                return $this->redirect($request->headers->get('referer'));
+            }
+        }
+
+        $schemas = $manager->getSchemas();
+
+        return $this->render(
+            '@ChamiloCore/Course/settings.html.twig',
+            [
+                'course' => $course,
+                'schemas' => $schemas,
+                'settings' => $settings,
+                'form' => $form,
+            ]
+        );
+    }
+
+    #[Route('/{id}/about', name: 'chamilo_core_course_about')]
+    public function about(
+        Course $course,
+        IllustrationRepository $illustrationRepository,
+        CCourseDescriptionRepository $courseDescriptionRepository,
+        EntityManagerInterface $em,
+        Request $request
+    ): Response {
+        $courseId = $course->getId();
+
+        $user = $this->userHelper->getCurrent();
+
+        if (!$this->isGranted(CourseVoter::VIEW, $course)) {
+            throw $this->createAccessDeniedException();
+        }
+
+        $fieldsRepo = $em->getRepository(ExtraField::class);
+
+        /** @var TagRepository $tagRepo */
+        $tagRepo = $em->getRepository(Tag::class);
+
+        $courseDescriptions = $courseDescriptionRepository->findAllInCourseForCatalogue($course);
+
+        $courseValues = new ExtraFieldValue('course');
+
+        $urlCourse = api_get_path(WEB_PATH).\sprintf('course/%s/about', $courseId);
+        $courseTeachers = $course->getTeachersSubscriptions();
+        $teachersData = [];
+
+        foreach ($courseTeachers as $teacherSubscription) {
+            $teacher = $teacherSubscription->getUser();
+            $userData = [
+                'complete_name' => UserManager::formatUserFullName($teacher),
+                'image' => $illustrationRepository->getIllustrationUrl($teacher),
+                'diploma' => $teacher->getDiplomas(),
+                'openarea' => $this->sanitizeCourseAboutHtml((string) $teacher->getOpenarea()),
+            ];
+
+            $teachersData[] = $userData;
+        }
+
+        /** @var ExtraField $tagField */
+        $tagField = $fieldsRepo->findOneBy([
+            'itemType' => ExtraField::COURSE_FIELD_TYPE,
+            'variable' => 'tags',
+        ]);
+
+        $courseTags = [];
+        if (null !== $tagField) {
+            $courseTags = $tagRepo->getTagsByItem($tagField, $courseId);
+        }
+
+        $courseDescription = $courseObjectives = $courseTopics = $courseMethodology = '';
+        $courseMaterial = $courseResources = $courseAssessment = '';
+        $courseCustom = [];
+        $descriptionSections = [];
+
+        foreach ($courseDescriptions as $descriptionTool) {
+            if (!$descriptionTool instanceof CCourseDescription) {
+                continue;
+            }
+
+            $section = $this->buildCourseAboutDescriptionSection($descriptionTool);
+            if (null !== $section) {
+                $descriptionSections[] = $section;
+            }
+
+            switch ($descriptionTool->getDescriptionType()) {
+                case CCourseDescription::TYPE_DESCRIPTION:
+                    $courseDescription = $section['content'] ?? '';
+
+                    break;
+
+                case CCourseDescription::TYPE_OBJECTIVES:
+                    $courseObjectives = $descriptionTool;
+
+                    break;
+
+                case CCourseDescription::TYPE_TOPICS:
+                    $courseTopics = $descriptionTool;
+
+                    break;
+
+                case CCourseDescription::TYPE_METHODOLOGY:
+                    $courseMethodology = $descriptionTool;
+
+                    break;
+
+                case CCourseDescription::TYPE_COURSE_MATERIAL:
+                    $courseMaterial = $descriptionTool;
+
+                    break;
+
+                case CCourseDescription::TYPE_RESOURCES:
+                    $courseResources = $descriptionTool;
+
+                    break;
+
+                case CCourseDescription::TYPE_ASSESSMENT:
+                    $courseAssessment = $descriptionTool;
+
+                    break;
+
+                case CCourseDescription::TYPE_CUSTOM:
+                    $courseCustom[] = $descriptionTool;
+
+                    break;
+            }
+        }
+
+        if ('' === $courseDescription && [] !== $descriptionSections) {
+            $courseDescription = (string) ($descriptionSections[0]['content'] ?? '');
+        }
+
+        $topics = [
+            'objectives' => $courseObjectives,
+            'topics' => $courseTopics,
+            'methodology' => $courseMethodology,
+            'material' => $courseMaterial,
+            'resources' => $courseResources,
+            'assessment' => $courseAssessment,
+            'custom' => array_reverse($courseCustom),
+        ];
+
+        $subscriptionUser = false;
+
+        if ($user) {
+            $subscriptionUser = CourseManager::is_user_subscribed_in_course($user->getId(), $course->getCode());
+        }
+
+        $allowSubscribe = CourseManager::canUserSubscribeToCourse($course->getCode());
+
+        $image = Container::getIllustrationRepository()->getIllustrationUrl($course, 'course_picture_medium');
+
+        $params = [
+            'course' => $course,
+            'description' => $courseDescription,
+            'description_sections' => $descriptionSections,
+            'image' => $image,
+            'syllabus' => $topics,
+            'tags' => $courseTags,
+            'teachers' => $teachersData,
+            'extra_fields' => $courseValues->getAllValuesForAnItem(
+                $course->getId(),
+                null,
+                true
+            ),
+            'subscription' => $subscriptionUser,
+            'url' => $urlCourse,
+            'is_premium' => '',
+            'token' => \Security::get_token(),
+            'base_url' => $request->getSchemeAndHttpHost(),
+            'allow_subscribe' => $allowSubscribe,
+            'room_location' => $this->buildCourseRoomLocation($course),
+        ];
+
+        $metaInfo = '<meta property="og:url" content="'.htmlspecialchars($urlCourse, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').'" />';
+        $metaInfo .= '<meta property="og:type" content="website" />';
+        $metaInfo .= '<meta property="og:title" content="'.htmlspecialchars($course->getTitle(), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').'" />';
+        $metaInfo .= '<meta property="og:description" content="'.htmlspecialchars(strip_tags($courseDescription), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').'" />';
+        $metaInfo .= '<meta property="og:image" content="'.htmlspecialchars($image, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').'" />';
+
+        $htmlHeadXtra[] = $metaInfo;
+        $htmlHeadXtra[] = api_get_asset('readmore-js/readmore.js');
+
+        return $this->render('@ChamiloCore/Course/about.html.twig', $params);
+    }
+
+    private function buildCourseRoomLocation(Course $course): ?array
+    {
+        $room = $course->getRoom();
+        if (null === $room) {
+            return null;
+        }
+
+        $geolocation = trim((string) $room->getGeolocation());
+        if ('' === $geolocation) {
+            return null;
+        }
+
+        $parts = array_map('trim', explode(',', $geolocation));
+        if (2 !== \count($parts) || !is_numeric($parts[0]) || !is_numeric($parts[1])) {
+            return null;
+        }
+
+        $latitude = (float) $parts[0];
+        $longitude = (float) $parts[1];
+
+        if ($latitude < -90.0 || $latitude > 90.0 || $longitude < -180.0 || $longitude > 180.0) {
+            return null;
+        }
+
+        $delta = 0.05;
+        $bbox = implode(',', [
+            $longitude - $delta,
+            $latitude - $delta,
+            $longitude + $delta,
+            $latitude + $delta,
+        ]);
+        $marker = $latitude.','.$longitude;
+
+        return [
+            'title' => $room->getTitle(),
+            'latitude' => $latitude,
+            'longitude' => $longitude,
+            'embed_url' => 'https://www.openstreetmap.org/export/embed.html?'.http_build_query(
+                [
+                    'bbox' => $bbox,
+                    'layer' => 'mapnik',
+                    'marker' => $marker,
+                ],
+                '',
+                '&',
+                PHP_QUERY_RFC3986,
+            ),
+        ];
+    }
+
+    private function buildCourseAboutDescriptionSection(CCourseDescription $description): ?array
+    {
+        $title = trim(strip_tags((string) $description->getTitle()));
+        $content = $this->sanitizeCourseAboutHtml((string) $description->getContent());
+
+        if ('' === $title && '' === strip_tags($content)) {
+            return null;
+        }
+
+        return [
+            'iid' => $description->getIid(),
+            'title' => $title,
+            'content' => $content,
+            'type' => $description->getDescriptionType(),
+            'progress' => $description->getProgress(),
+        ];
+    }
+
+    private function sanitizeCourseAboutHtml(string $content): string
+    {
+        $content = trim($content);
+
+        if ('' === $content) {
+            return '';
+        }
+
+        if (class_exists('Security')) {
+            $userStatus = \defined('STUDENT') ? \STUDENT : null;
+
+            return (string) \Security::remove_XSS($content, $userStatus);
+        }
+
+        return $content;
+    }
+
+    #[Route('/{id}/welcome', name: 'chamilo_core_course_welcome')]
+    public function welcome(Course $course): Response
+    {
+        return $this->render('@ChamiloCore/Course/welcome.html.twig', [
+            'course' => $course,
+        ]);
+    }
+
+    #[Route('/check-enrollments', name: 'chamilo_core_check_enrollments', methods: ['GET'])]
+    public function checkEnrollments(Request $request, EntityManagerInterface $em, SettingsManager $settingsManager): JsonResponse
+    {
+        $user = $this->userHelper->getCurrent();
+
+        if (!$user) {
+            return new JsonResponse(['error' => 'User not found'], Response::HTTP_UNAUTHORIZED);
+        }
+
+        if ($request->hasSession() && $request->getSession()->isStarted()) {
+            $request->getSession()->save();
+        }
+
+        $isEnrolledInCourses = $this->isUserEnrolledInAnyCourse($user, $em);
+        $isEnrolledInSessions = $this->isUserEnrolledInAnySession($user, $em);
+
+        if (!$isEnrolledInCourses && !$isEnrolledInSessions) {
+            $defaultMenuEntry = $settingsManager->getSetting('workflows.default_menu_entry_for_course_or_session');
+            $isEnrolledInCourses = 'my_courses' === $defaultMenuEntry;
+            $isEnrolledInSessions = 'my_sessions' === $defaultMenuEntry;
+        }
+
+        return new JsonResponse([
+            'isEnrolledInCourses' => $isEnrolledInCourses,
+            'isEnrolledInSessions' => $isEnrolledInSessions,
+        ]);
+    }
+
+    #[Route('/search_templates', name: 'chamilo_core_course_search_templates')]
+    public function searchCourseTemplates(
+        Request $request,
+        AccessUrlHelper $accessUrlUtil,
+        CourseRepository $courseRepository
+    ): JsonResponse {
+        $searchTerm = $request->query->get('search', '');
+        $accessUrl = $accessUrlUtil->getCurrent();
+
+        $user = $this->userHelper->getCurrent();
+
+        $courseList = $courseRepository->getCoursesInfoByUser($user, $accessUrl, 1, $searchTerm);
+        $results = ['items' => []];
+        foreach ($courseList as $course) {
+            $title = $course['title'];
+            $results['items'][] = [
+                'id' => $course['id'],
+                'name' => $title.' ('.$course['code'].') ',
+            ];
+        }
+
+        return new JsonResponse($results);
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/create', name: 'chamilo_core_course_create')]
+    public function createCourse(
+        Request $request,
+        TranslatorInterface $translator,
+        CourseHelper $courseHelper
+    ): JsonResponse {
+        $courseData = json_decode($request->getContent(), true);
+
+        if (!\is_array($courseData)) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => $translator->trans('Invalid request payload.'),
+                ],
+                Response::HTTP_BAD_REQUEST
+            );
+        }
+
+        $user = $this->userHelper->getCurrent();
+
+        if (!$user || !method_exists($user, 'getId')) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => $translator->trans('Authentication required.'),
+                ],
+                Response::HTTP_UNAUTHORIZED
+            );
+        }
+
+        $capabilityStatus = $this->resolveCourseCreateCapabilityStatus($user, $translator, $courseHelper);
+
+        $buyCoursesServiceSaleId = null;
+        if (isset($courseData['buyCoursesServiceSaleId']) && \is_scalar($courseData['buyCoursesServiceSaleId'])) {
+            $candidateServiceSaleId = (int) $courseData['buyCoursesServiceSaleId'];
+            $buyCoursesServiceSaleId = $candidateServiceSaleId > 0 ? $candidateServiceSaleId : null;
+        }
+
+        if (!$capabilityStatus['canCreate'] && null === $buyCoursesServiceSaleId) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => (string) $capabilityStatus['message'],
+                    'limitSource' => (string) $capabilityStatus['limitSource'],
+                    'effectiveLimit' => (int) $capabilityStatus['effectiveLimit'],
+                    'currentCount' => (int) $capabilityStatus['currentCount'],
+                ],
+                Response::HTTP_FORBIDDEN
+            );
+        }
+
+        $normalizeScalar = static function (mixed $value): ?string {
+            if (null === $value || '' === $value) {
+                return null;
+            }
+
+            if (\is_scalar($value)) {
+                return trim((string) $value);
+            }
+
+            if (\is_array($value)) {
+                foreach (['code', 'id', 'value', 'name'] as $key) {
+                    if (isset($value[$key]) && \is_scalar($value[$key])) {
+                        return trim((string) $value[$key]);
+                    }
+                }
+
+                $first = reset($value);
+
+                if (\is_scalar($first)) {
+                    return trim((string) $first);
+                }
+
+                if (\is_array($first)) {
+                    foreach (['code', 'id', 'value', 'name'] as $key) {
+                        if (isset($first[$key]) && \is_scalar($first[$key])) {
+                            return trim((string) $first[$key]);
+                        }
+                    }
+                }
+            }
+
+            return null;
+        };
+
+        $normalizeIntArray = static function (mixed $value): array {
+            if (null === $value || '' === $value) {
+                return [];
+            }
+
+            if (\is_scalar($value)) {
+                $intValue = (int) $value;
+
+                return $intValue > 0 ? [$intValue] : [];
+            }
+
+            if (!\is_array($value)) {
+                return [];
+            }
+
+            $normalized = [];
+
+            foreach ($value as $item) {
+                if (\is_scalar($item)) {
+                    $intValue = (int) $item;
+                    if ($intValue > 0) {
+                        $normalized[] = $intValue;
+                    }
+
+                    continue;
+                }
+
+                if (\is_array($item)) {
+                    foreach (['id', 'value', 'code'] as $key) {
+                        if (isset($item[$key]) && \is_scalar($item[$key])) {
+                            $intValue = (int) $item[$key];
+                            if ($intValue > 0) {
+                                $normalized[] = $intValue;
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return array_values(array_unique($normalized));
+        };
+
+        $title = $normalizeScalar($courseData['name'] ?? null);
+        $wantedCode = $normalizeScalar($courseData['code'] ?? null);
+        $courseLanguage = $normalizeScalar($courseData['language'] ?? null);
+        $template = $normalizeScalar($courseData['template'] ?? null) ?? '';
+        $categoryIds = $normalizeIntArray($courseData['category'] ?? null);
+        $exemplaryContent = !empty($courseData['fillDemoContent']);
+
+        if (empty($title)) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => $translator->trans('The course title is required.'),
+                ],
+                Response::HTTP_BAD_REQUEST
+            );
+        }
+
+        $params = [
+            'title' => $title,
+            'wanted_code' => $wantedCode,
+            'course_language' => $courseLanguage,
+            'exemplary_content' => $exemplaryContent,
+            'course_template' => $template,
+        ];
+
+        if (null !== $buyCoursesServiceSaleId) {
+            $params['buycourses_service_sale_id'] = $buyCoursesServiceSaleId;
+        }
+
+        if (!empty($categoryIds)) {
+            $params['course_categories'] = $categoryIds;
+        }
+
+        try {
+            $course = $courseHelper->createCourse($params);
+            if ($course) {
+                return new JsonResponse([
+                    'success' => true,
+                    'message' => $translator->trans('Course created successfully.'),
+                    'courseId' => $course->getId(),
+                ]);
+            }
+        } catch (InvalidArgumentException $exception) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => $exception->getMessage(),
+                ],
+                Response::HTTP_BAD_REQUEST
+            );
+        } catch (RuntimeException $exception) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => $exception->getMessage(),
+                ],
+                Response::HTTP_FORBIDDEN
+            );
+        } catch (UniqueConstraintViolationException $exception) {
+            if ($this->isCourseCodeUniqueConstraintViolation($exception)) {
+                return new JsonResponse(
+                    [
+                        'success' => false,
+                        'message' => $this->getDuplicateCourseCreationMessage($wantedCode, $translator),
+                    ],
+                    Response::HTTP_CONFLICT
+                );
+            }
+
+            return $this->createCourseCreationServerErrorResponse($exception, $translator);
+        } catch (Throwable $exception) {
+            return $this->createCourseCreationServerErrorResponse($exception, $translator);
+        }
+
+        return new JsonResponse(
+            [
+                'success' => false,
+                'message' => $translator->trans('An error occurred while creating the course.'),
+            ],
+            Response::HTTP_BAD_REQUEST
+        );
+    }
+
+    private function isCourseCodeUniqueConstraintViolation(UniqueConstraintViolationException $exception): bool
+    {
+        $message = $exception->getMessage();
+
+        return str_contains($message, 'UNIQ_169E6FB977153098')
+            || str_contains($message, "for key 'code'")
+            || str_contains($message, 'for key "code"');
+    }
+
+    private function getDuplicateCourseCreationMessage(?string $wantedCode, TranslatorInterface $translator): string
+    {
+        if (null !== $wantedCode && '' !== trim($wantedCode)) {
+            return $translator->trans('This course code already exists, please choose another code.');
+        }
+
+        return $translator->trans('This course title already exists, please choose another title.');
+    }
+
+    private function createCourseCreationServerErrorResponse(
+        Throwable $exception,
+        TranslatorInterface $translator
+    ): JsonResponse {
+        error_log(
+            '[course.create] throwable='.
+            $exception::class.
+            ' message='.$exception->getMessage().
+            ' file='.$exception->getFile().
+            ' line='.(string) $exception->getLine().
+            ' peak='.memory_get_peak_usage(true)
+        );
+
+        return new JsonResponse(
+            [
+                'success' => false,
+                'message' => $translator->trans('An error occurred while creating the course.'),
+            ],
+            Response::HTTP_INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/create-capability', name: 'chamilo_core_course_create_capability', methods: ['GET'])]
+    public function createCourseCapability(
+        TranslatorInterface $translator,
+        CourseHelper $courseHelper,
+    ): JsonResponse {
+        $user = $this->userHelper->getCurrent();
+
+        if (!$user instanceof User) {
+            return new JsonResponse(
+                [
+                    'success' => false,
+                    'message' => $translator->trans('Authentication required.'),
+                ],
+                Response::HTTP_UNAUTHORIZED
+            );
+        }
+
+        $status = $this->resolveCourseCreateCapabilityStatus($user, $translator, $courseHelper);
+
+        return new JsonResponse([
+            'success' => 'error' !== (string) ($status['limitSource'] ?? ''),
+            'canCreate' => (bool) ($status['canCreate'] ?? false),
+            'currentCount' => (int) ($status['currentCount'] ?? 0),
+            'effectiveLimit' => (int) ($status['effectiveLimit'] ?? 0),
+            'serviceLimit' => isset($status['serviceLimit']) ? (int) $status['serviceLimit'] : null,
+            'globalLimit' => (int) ($status['globalLimit'] ?? 0),
+            'limitSource' => (string) ($status['limitSource'] ?? 'error'),
+            'message' => (string) ($status['message'] ?? ''),
+        ]);
+    }
+
+    private function resolveCourseCreateCapabilityStatus(
+        User $user,
+        TranslatorInterface $translator,
+        CourseHelper $courseHelper,
+    ): array {
+        if ($this->isGranted('ROLE_ADMIN')) {
+            return [
+                'canCreate' => true,
+                'currentCount' => 0,
+                'effectiveLimit' => 0,
+                'serviceLimit' => null,
+                'globalLimit' => 0,
+                'limitSource' => 'admin',
+                'message' => '',
+            ];
+        }
+
+        try {
+            $status = $courseHelper->resolveCourseCreationCapabilityForUser($user);
+
+            $canCreate = (bool) ($status['canCreate'] ?? true);
+            $currentCount = (int) ($status['currentCount'] ?? 0);
+            $effectiveLimit = (int) ($status['effectiveLimit'] ?? 0);
+            $limitSource = (string) ($status['limitSource'] ?? 'unlimited');
+
+            $message = '';
+            if (!$canCreate) {
+                if ('service' === $limitSource) {
+                    $message = \sprintf(
+                        $translator->trans(
+                            'You already manage %d courses and your active service allows up to %d. To create another course, you need a higher service limit or reduce your current active courses.'
+                        ),
+                        $currentCount,
+                        $effectiveLimit
+                    );
+                } elseif ('role' === $limitSource) {
+                    $message = $translator->trans('Only trainers and administrators can create courses.');
+                } elseif ('setting' === $limitSource) {
+                    $message = $translator->trans('Course creation by trainers is disabled on this platform.');
+                } else {
+                    $message = \sprintf(
+                        $translator->trans(
+                            'You already manage %d courses and the platform currently allows up to %d for your account. You cannot create more courses right now.'
+                        ),
+                        $currentCount,
+                        $effectiveLimit
+                    );
+                }
+            }
+
+            $status['message'] = $message;
+
+            return $status;
+        } catch (Throwable $exception) {
+            error_log('[Course] Failed to resolve course creation capability: '.$exception->getMessage());
+
+            return [
+                'canCreate' => true,
+                'currentCount' => 0,
+                'effectiveLimit' => 0,
+                'serviceLimit' => null,
+                'globalLimit' => 0,
+                'limitSource' => 'error',
+                'message' => $translator->trans('Unable to verify whether you can create a new course right now.'),
+            ];
+        }
+    }
+
+    #[Route('/{id}/getAutoLaunchExerciseId', name: 'chamilo_core_course_get_auto_launch_exercise_id', methods: ['GET'])]
+    public function getAutoLaunchExerciseId(
+        Request $request,
+        Course $course,
+        CQuizRepository $quizRepository,
+        EntityManagerInterface $em
+    ): JsonResponse {
+        $data = $request->getContent();
+        $data = json_decode($data);
+        $sessionId = $data->sid ?? 0;
+
+        $sessionRepo = $em->getRepository(Session::class);
+        $session = null;
+        if (!empty($sessionId)) {
+            $session = $sessionRepo->find($sessionId);
+        }
+
+        $autoLaunchExerciseId = $quizRepository->findAutoLaunchableQuizByCourseAndSession($course, $session);
+
+        return new JsonResponse(['exerciseId' => $autoLaunchExerciseId], Response::HTTP_OK);
+    }
+
+    #[Route('/{id}/getAutoLaunchLPId', name: 'chamilo_core_course_get_auto_launch_lp_id', methods: ['GET'])]
+    public function getAutoLaunchLPId(
+        Request $request,
+        Course $course,
+        CLpRepository $lpRepository,
+        EntityManagerInterface $em
+    ): JsonResponse {
+        $data = $request->getContent();
+        $data = json_decode($data);
+        $sessionId = $data->sid ?? 0;
+
+        $sessionRepo = $em->getRepository(Session::class);
+        $session = null;
+        if (!empty($sessionId)) {
+            $session = $sessionRepo->find($sessionId);
+        }
+
+        $autoLaunchLPId = $lpRepository->findAutoLaunchableLPByCourseAndSession($course, $session);
+
+        return new JsonResponse(['lpId' => $autoLaunchLPId], Response::HTTP_OK);
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/{cid}/student-info.json', name: 'chamilo_core_course_student_info_json', methods: ['GET'])]
+    public function studentInfoJson(
+        Request $request,
+        #[MapEntity(expr: 'repository.find(cid)')]
+        Course $course,
+        CourseStudentInfoHelper $studentInfoHelper
+    ): JsonResponse {
+        $user = $this->userHelper->getCurrent();
+
+        if (!$user || !method_exists($user, 'getId')) {
+            return new JsonResponse(['error' => 'Authentication required.'], Response::HTTP_UNAUTHORIZED);
+        }
+
+        $userId = (int) $user->getId();
+        $sessionId = (int) $request->query->get('sid', '0');
+
+        if (0 === $sessionId) {
+            $this->denyAccessUnlessGranted(CourseVoter::VIEW, $course);
+        }
+
+        // Extra safety for invitees (same logic as home.json).
+        if (method_exists($user, 'isInvitee') && $user->isInvitee()) {
+            $isSubscribed = CourseManager::is_user_subscribed_in_course(
+                $userId,
+                $course->getCode(),
+                $sessionId > 0,
+                $sessionId
+            );
+
+            if (!$isSubscribed) {
+                throw $this->createAccessDeniedException('User is not subscribed to the course.');
+            }
+        }
+
+        $payload = $studentInfoHelper->getStudentInfoForCourse($userId, $course, $sessionId);
+
+        return new JsonResponse($payload, Response::HTTP_OK);
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/student-info-batch.json', name: 'chamilo_core_course_student_info_batch_json', methods: ['POST'])]
+    public function studentInfoBatchJson(
+        Request $request,
+        CourseStudentInfoHelper $studentInfoHelper
+    ): JsonResponse {
+        $user = $this->userHelper->getCurrent();
+
+        if (!$user || !method_exists($user, 'getId')) {
+            return new JsonResponse(['error' => 'Authentication required.'], Response::HTTP_UNAUTHORIZED);
+        }
+
+        $payload = json_decode($request->getContent() ?: '', true) ?? [];
+        $sessionId = (int) ($payload['sid'] ?? 0);
+
+        $courseIds = $payload['courseIds'] ?? [];
+        if (!\is_array($courseIds)) {
+            $courseIds = [];
+        }
+
+        $courseIds = array_values(array_unique(array_map('intval', $courseIds)));
+        $courseIds = array_filter($courseIds, static fn (int $id) => $id > 0);
+        if (\count($courseIds) > 300) {
+            $courseIds = \array_slice($courseIds, 0, 300);
+        }
+
+        if (empty($courseIds)) {
+            return new JsonResponse([
+                'sid' => $sessionId,
+                'items' => [],
+            ], Response::HTTP_OK);
+        }
+
+        // Load courses in one go.
+        /** @var Course[] $courses */
+        $courses = $this->em->getRepository(Course::class)->findBy(['id' => $courseIds]);
+
+        $allowedCourseIds = [];
+        $courseMap = [];
+        foreach ($courses as $course) {
+            $cid = (int) $course->getId();
+            $courseMap[$cid] = $course;
+        }
+
+        $userId = (int) $user->getId();
+
+        foreach ($courseIds as $cid) {
+            $course = $courseMap[$cid] ?? null;
+            if (!$course instanceof Course) {
+                continue;
+            }
+
+            if (0 === $sessionId) {
+                try {
+                    $this->denyAccessUnlessGranted(CourseVoter::VIEW, $course);
+                } catch (Throwable $e) {
+                    // Skip unauthorized courses without failing the whole batch.
+                    continue;
+                }
+            }
+
+            // Extra safety for invitees (same logic as home.json / studentInfoJson).
+            if (method_exists($user, 'isInvitee') && $user->isInvitee()) {
+                $isSubscribed = CourseManager::is_user_subscribed_in_course(
+                    $userId,
+                    $course->getCode(),
+                    $sessionId > 0,
+                    $sessionId
+                );
+
+                if (!$isSubscribed) {
+                    continue;
+                }
+            }
+
+            $allowedCourseIds[] = $cid;
+        }
+
+        if (empty($allowedCourseIds)) {
+            return new JsonResponse([
+                'sid' => $sessionId,
+                'items' => [],
+            ], Response::HTTP_OK);
+        }
+
+        // Compute in batch
+        $items = $studentInfoHelper->getStudentInfoBatchForCourses($userId, $allowedCourseIds, $sessionId);
+
+        return new JsonResponse([
+            'sid' => $sessionId,
+            'items' => $items, // courseId => studentInfo
+        ], Response::HTTP_OK);
+    }
+
+    #[IsGranted('ROLE_USER')]
+    #[Route('/{cid}/new-content-tools.json', name: 'chamilo_core_course_new_content_tools_json', methods: ['GET'])]
+    public function newContentToolsJson(
+        Request $request,
+        #[MapEntity(expr: 'repository.find(cid)')]
+        Course $course,
+        CourseStudentInfoHelper $studentInfoHelper
+    ): JsonResponse {
+        $user = $this->userHelper->getCurrent();
+
+        if (!$user || !method_exists($user, 'getId')) {
+            return new JsonResponse(['error' => 'Authentication required.'], Response::HTTP_UNAUTHORIZED);
+        }
+
+        $userId = (int) $user->getId();
+        $sessionId = (int) $request->query->get('sid', '0');
+        $limit = (int) $request->query->get('limit', '20');
+        if ($limit <= 0) {
+            $limit = 20;
+        }
+        if ($limit > 50) {
+            $limit = 50;
+        }
+
+        if (0 === $sessionId) {
+            $this->denyAccessUnlessGranted(CourseVoter::VIEW, $course);
+        }
+
+        if (method_exists($user, 'isInvitee') && $user->isInvitee()) {
+            $isSubscribed = CourseManager::is_user_subscribed_in_course(
+                $userId,
+                $course->getCode(),
+                $sessionId > 0,
+                $sessionId
+            );
+
+            if (!$isSubscribed) {
+                throw $this->createAccessDeniedException('User is not subscribed to the course.');
+            }
+        }
+
+        $items = $studentInfoHelper->getNewContentToolsForCourse($userId, $course, $sessionId, $limit);
+
+        return new JsonResponse([
+            'cid' => (int) $course->getId(),
+            'sid' => $sessionId,
+            'items' => $items,
+            'meta' => [
+                // Optional debug/help info for UI:
+                'lastAccess' => $studentInfoHelper->getLastAccessLabelForCourse($userId, (int) $course->getId(), $sessionId),
+            ],
+        ], Response::HTTP_OK);
+    }
+
+    private function buildExerciseVueToolUrl(?int $exerciseId = null): ?string
+    {
+        $course = $this->getCourse();
+        if (!$course instanceof Course) {
+            $course = api_get_course_entity();
+        }
+
+        if (!$course instanceof Course || null === $course->getResourceNode()) {
+            return null;
+        }
+
+        $nodeId = $course->getResourceNode()->getId();
+        if (null === $nodeId) {
+            return null;
+        }
+
+        $path = '/resources/exercise/'.(int) $nodeId.'/';
+        if (null !== $exerciseId && $exerciseId > 0) {
+            $path .= $exerciseId.'/overview';
+        }
+
+        $query = http_build_query([
+            'cid' => (int) api_get_course_int_id(),
+            'sid' => (int) api_get_session_id(),
+            'gid' => (int) api_get_group_id(),
+        ]);
+
+        return rtrim(api_get_path(WEB_PATH), '/').$path.'?'.$query;
+    }
+
+    private function isExerciseToolEntry(string $toolName, string $toolTitle, string $link): bool
+    {
+        $toolCandidates = array_map('strtolower', [$toolName, $toolTitle]);
+
+        foreach ($toolCandidates as $candidate) {
+            if (\in_array($candidate, ['quiz', 'exercise', 'exercises', 'tests'], true)) {
+                return true;
+            }
+        }
+
+        return str_contains($link, 'exercise/exercise.php')
+            || str_contains($link, '/main/exercise/exercise.php');
+    }
+
+    private function isCourseHomeResourcePublished(
+        AbstractResource $resource,
+        Course $course,
+        ?Session $session
+    ): bool {
+        $resourceNode = $resource->getResourceNode();
+        if (null === $resourceNode) {
+            return false;
+        }
+
+        $baseLink = null;
+
+        $courseId = $course->getId();
+        $sessionId = $session?->getId();
+
+        foreach ($resourceNode->getResourceLinks() as $resourceLink) {
+            if ($resourceLink->getCourse()?->getId() !== $courseId
+                || null !== $resourceLink->getGroup()
+                || null !== $resourceLink->getUserGroup()
+                || null !== $resourceLink->getUser()
+            ) {
+                continue;
+            }
+
+            $resourceSessionId = $resourceLink->getSession()?->getId();
+
+            if (null !== $sessionId && $resourceSessionId === $sessionId) {
+                return ResourceLink::VISIBILITY_PUBLISHED === $resourceLink->getVisibility();
+            }
+
+            if (null === $resourceSessionId) {
+                $baseLink = $resourceLink;
+            }
+        }
+
+        return $baseLink instanceof ResourceLink
+            && ResourceLink::VISIBILITY_PUBLISHED === $baseLink->getVisibility();
+    }
+
+    private function isTruthyCourseHomeSetting(mixed $value): bool
+    {
+        if (\is_bool($value)) {
+            return $value;
+        }
+
+        return \in_array(strtolower(trim((string) $value)), ['1', 'true', 'yes', 'on'], true);
+    }
+
+    /**
+     * Ensure a "course_homepage" CTool exists for the given course + session context.
+     * - If $session is null, it creates/returns the base tool.
+     * - If $session is not null, it creates/returns the session tool.
+     */
+    private function ensureCourseHomepageTool(Course $course, ?Session $session, EntityManagerInterface $em): ?CTool
+    {
+        $ctoolRepo = $em->getRepository(CTool::class);
+
+        $existing = $ctoolRepo->findOneBy([
+            'title' => 'course_homepage',
+            'course' => $course,
+            'session' => $session,
+        ]);
+
+        if ($existing) {
+            return $existing;
+        }
+
+        $toolEntity = $em->getRepository(Tool::class)->findOneBy(['title' => 'course_homepage']);
+        if (!$toolEntity) {
+            return null;
+        }
+
+        $ctool = (new CTool())
+            ->setTool($toolEntity)
+            ->setTitle('course_homepage')
+            ->setCourse($course)
+            ->setPosition(1)
+            ->setParent($course)
+            ->setCreator($course->getCreator())
+            ->setSession($session)
+            ->addCourseLink($course)
+        ;
+
+        $em->persist($ctool);
+        $em->flush();
+
+        return $ctool;
+    }
+
+    // Implement the real logic to check course enrollment
+    private function isUserEnrolledInAnyCourse(User $user, EntityManagerInterface $em): bool
+    {
+        $enrollmentCount = $em
+            ->getRepository(CourseRelUser::class)
+            ->count(['user' => $user])
+        ;
+
+        return $enrollmentCount > 0;
+    }
+
+    // Implement the real logic to check session enrollment
+    private function isUserEnrolledInAnySession(User $user, EntityManagerInterface $em): bool
+    {
+        $enrollmentCount = $em->getRepository(SessionRelUser::class)
+            ->count(['user' => $user])
+        ;
+
+        return $enrollmentCount > 0;
+    }
+
+    /**
+     * Reorders all course tools for a given course / session after drag & drop.
+     *
+     * @return array<string, mixed>
+     */
+    private function reorderCourseTools(
+        EntityManagerInterface $em,
+        Course $course,
+        int $sessionId,
+        int $toolId,
+        int $newIndex
+    ): array {
+        if ($toolId <= 0) {
+            return [
+                'success' => false,
+                'message' => 'Invalid tool id.',
+            ];
+        }
+
+        /** @var CToolRepository $toolRepo */
+        $toolRepo = $em->getRepository(CTool::class);
+
+        // Load all tools for this course + (optional) session ordered by current position
+        $qb = $toolRepo->createQueryBuilder('t')
+            ->andWhere('t.course = :course')
+            ->setParameter('course', $course->getId())
+            ->orderBy('t.position', 'ASC')
+            ->addOrderBy('t.iid', 'ASC')
+        ;
+
+        if ($sessionId > 0) {
+            $qb
+                ->andWhere('IDENTITY(t.session) = :sessionId')
+                ->setParameter('sessionId', $sessionId)
+            ;
+        } else {
+            $qb->andWhere('t.session IS NULL');
+        }
+
+        /** @var CTool[] $tools */
+        $tools = $qb->getQuery()->getResult();
+
+        if (0 === \count($tools)) {
+            return [
+                'success' => false,
+                'message' => 'No tools found for course / session.',
+            ];
+        }
+
+        // Build an array of IDs to manipulate positions easily
+        $ids = array_map(static fn (CTool $tool): int => $tool->getIid() ?? 0, $tools);
+
+        $currentIndex = array_search($toolId, $ids, true);
+        if (false === $currentIndex) {
+            return [
+                'success' => false,
+                'message' => 'Tool not found in current course / session.',
+            ];
+        }
+
+        // Clamp the new index into a valid range
+        $newIndex = max(0, min($newIndex, \count($tools) - 1));
+
+        if ($newIndex === $currentIndex) {
+            return [
+                'success' => true,
+                'unchanged' => true,
+                'from' => $currentIndex,
+                'to' => $newIndex,
+                'total' => \count($tools),
+            ];
+        }
+
+        // Move the ID in the array (remove at old index, insert at new index)
+        $idToMove = $ids[$currentIndex];
+        array_splice($ids, $currentIndex, 1);
+        array_splice($ids, $newIndex, 0, [$idToMove]);
+
+        // Rewrite all positions in DB using a simple DQL UPDATE per tool
+        // Positions will be 0-based: 0,1,2,...
+        foreach ($ids as $pos => $id) {
+            $em->createQueryBuilder()
+                ->update(CTool::class, 't')
+                ->set('t.position', ':pos')
+                ->where('t.iid = :iid')
+                ->setParameter('pos', $pos)
+                ->setParameter('iid', $id)
+                ->getQuery()
+                ->execute()
+            ;
+        }
+
+        return [
+            'success' => true,
+            'from' => $currentIndex,
+            'to' => $newIndex,
+            'total' => \count($tools),
+            'courseId' => $course->getId(),
+            'sessionId' => $sessionId,
+        ];
+    }
+}

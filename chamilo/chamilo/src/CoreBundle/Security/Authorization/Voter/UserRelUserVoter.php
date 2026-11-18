@@ -1,0 +1,108 @@
+<?php
+
+declare(strict_types=1);
+
+/* For licensing terms, see /license.txt */
+
+namespace Chamilo\CoreBundle\Security\Authorization\Voter;
+
+use Chamilo\CoreBundle\Entity\User;
+use Chamilo\CoreBundle\Entity\UserRelUser;
+use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\AccessDecisionManagerInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\Vote;
+use Symfony\Component\Security\Core\Authorization\Voter\Voter;
+use Symfony\Component\Security\Core\User\UserInterface;
+
+/**
+ * @extends Voter<'CREATE'|'VIEW'|'EDIT'|'DELETE', UserRelUser>
+ */
+class UserRelUserVoter extends Voter
+{
+    public const string CREATE = 'CREATE';
+    public const string VIEW = 'VIEW';
+    public const string EDIT = 'EDIT';
+    public const string DELETE = 'DELETE';
+
+    public function __construct(
+        private readonly AccessDecisionManagerInterface $accessDecisionManager
+    ) {}
+
+    protected function supports(string $attribute, $subject): bool
+    {
+        $options = [
+            self::CREATE,
+            self::VIEW,
+            self::EDIT,
+            self::DELETE,
+        ];
+
+        // if the attribute isn't one we support, return false
+        if (!\in_array($attribute, $options, true)) {
+            return false;
+        }
+
+        // only vote on Post objects inside this voter
+        return $subject instanceof UserRelUser;
+    }
+
+    protected function voteOnAttribute(string $attribute, $subject, TokenInterface $token, ?Vote $vote = null): bool
+    {
+        /** @var User $user */
+        $user = $token->getUser();
+
+        if (!$user instanceof UserInterface) {
+            return false;
+        }
+
+        // Admins have access to everything.
+        if ($this->accessDecisionManager->decide($token, ['ROLE_ADMIN'])) {
+            return true;
+        }
+
+        /** @var UserRelUser $userRelUser */
+        $userRelUser = $subject;
+
+        switch ($attribute) {
+            case self::CREATE:
+                if ($userRelUser->getUser() === $user) {
+                    return true;
+                }
+
+                break;
+
+            case self::EDIT:
+                if ($userRelUser->getUser() === $user) {
+                    return true;
+                }
+
+                if ($userRelUser->getFriend() === $user
+                    && UserRelUser::USER_RELATION_TYPE_FRIEND_REQUEST === $userRelUser->getRelationType()
+                ) {
+                    return true;
+                }
+
+                break;
+
+            case self::VIEW:
+                if ($userRelUser->getUser() === $user || $userRelUser->getFriend() === $user) {
+                    return true;
+                }
+
+                break;
+
+            case self::DELETE:
+                if ($userRelUser->getUser() === $user) {
+                    return true;
+                }
+
+                if ($userRelUser->getFriend() === $user) {
+                    return true;
+                }
+
+                break;
+        }
+
+        return false;
+    }
+}

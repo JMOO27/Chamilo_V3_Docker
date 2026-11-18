@@ -1,0 +1,246 @@
+<head>
+    <meta charset="utf-8">
+    <meta name="generator" content="Chamilo 3">
+    <link href="https://chamilo.org/chamilo-lms/" rel="help" />
+    <link href="https://chamilo.org/" rel="author" />
+    <link href="https://chamilo.org/" rel="copyright" />
+    <link rel="apple-touch-icon" href="{{ url('index') ~ 'apple-touch-icon.png' }}" />
+    <link rel="shortcut icon" href="{{ theme_asset('images/favicon.ico') }}" type="image/x-icon" />
+
+    {# Tracking meta settings (used for OpenGraph/Twitter and optional <title> override). #}
+    {# Normalize values as strings and trim spaces to prevent rendering empty tags. #}
+    {% set meta_title = chamilo_settings_get('tracking.meta_title')|default('')|trim %}
+    {% set meta_description = chamilo_settings_get('tracking.meta_description')|default('')|trim %}
+    {% set meta_image_path = chamilo_settings_get('tracking.meta_image_path')|default('')|trim %}
+    {% set meta_twitter_site = chamilo_settings_get('tracking.meta_twitter_site')|default('')|trim %}
+    {% set meta_twitter_creator = chamilo_settings_get('tracking.meta_twitter_creator')|default('')|trim %}
+
+    {# Render OG/Twitter only if at least one relevant setting is configured. #}
+    {% set has_tracking_meta = meta_title or meta_description or meta_image_path or meta_twitter_site or meta_twitter_creator %}
+
+    <title>
+        {%- block title -%}
+            {# Default <title>. If tracking.meta_title is set, use it as an override. #}
+            {% if meta_title %}
+                {{ meta_title }}
+            {% else %}
+                {{ chamilo_settings_get('platform.institution') }} - {{ chamilo_settings_get('platform.site_name') }}
+            {% endif %}
+        {%- endblock -%}
+    </title>
+
+    {% set bug_notification_link = '' %}
+    {% set help_content = '' %}
+    {% set header_extra_content = header_extra_content|default(chamilo_settings_get('tracking.header_extra_content')|default(''))|trim %}
+    {% set template = 'default' %}
+    {% set notification_menu = '' %}
+    {% set accessibility = '' %}
+    {% set containerClass = '' %}
+    {% set breadcrumb = '' %}
+    {% set user_notifications = '' %}
+    {% set message_url = '' %}
+    {% set profile_link = '' %}
+    {% set message_link = '' %}
+
+    {# Global feature flags shared by legacy, Vue and theme-level JavaScript. #}
+    {% set ai_disclosure_raw = chamilo_settings_get('ai_helpers.disclose_ai_assistance')|default('')|trim|lower %}
+    {% set ai_disclosure_enabled = ai_disclosure_raw in ['true', '1', 'yes', 'on', 'enabled'] %}
+    {% set disable_copy_paste_raw = chamilo_settings_get('platform.disable_copy_paste')|default('')|trim|lower %}
+    {% set disable_copy_paste_enabled = disable_copy_paste_raw in ['true', '1', 'yes', 'on', 'enabled'] %}
+    {% set mathjax_raw = chamilo_settings_get('editor.enabled_mathjax')|default('')|trim|lower %}
+    {% set mathjax_enabled = mathjax_raw in ['true', '1', 'yes', 'on', 'enabled'] %}
+
+    <script>
+      window.CH_AI_DISCLOSURE_ENABLED = {{ ai_disclosure_enabled ? 'true' : 'false' }};
+      window.CH_DISABLE_COPY_PASTE = {{ disable_copy_paste_enabled ? 'true' : 'false' }};
+      window.Chamilo = window.Chamilo || {};
+      window.Chamilo.settings = window.Chamilo.settings || {};
+      window.Chamilo.editor = window.Chamilo.editor || {};
+      window.Chamilo.settings.disableCopyPaste = window.CH_DISABLE_COPY_PASTE;
+      window.Chamilo.editor.disableCopyPaste = window.CH_DISABLE_COPY_PASTE;
+
+      (function () {
+        "use strict";
+
+        if (!window.CH_DISABLE_COPY_PASTE || window.__chamiloGlobalCopyPasteBlockerAttached) {
+          return;
+        }
+
+        window.__chamiloGlobalCopyPasteBlockerAttached = true;
+
+        var blockedKeys = ["c", "x", "v", "p", "s"];
+        var blockedEvents = ["cut", "copy", "paste", "drop", "contextmenu"];
+
+        function preventAction(event) {
+          if (event && typeof event.preventDefault === "function") {
+            event.preventDefault();
+          }
+
+          if (event && typeof event.stopPropagation === "function") {
+            event.stopPropagation();
+          }
+
+          if (event && typeof event.stopImmediatePropagation === "function") {
+            event.stopImmediatePropagation();
+          }
+
+          return false;
+        }
+
+        function getPressedKey(event) {
+          var key = String((event && event.key) || "").toLowerCase();
+
+          if (key) {
+            return key;
+          }
+
+          var keyCode = (event && (event.keyCode || event.which)) || 0;
+
+          return String.fromCharCode(keyCode).toLowerCase();
+        }
+
+        function isBlockedShortcut(event) {
+          if (!event || (!event.ctrlKey && !event.metaKey)) {
+            return false;
+          }
+
+          return blockedKeys.indexOf(getPressedKey(event)) !== -1;
+        }
+
+        function isBlockedInput(event) {
+          var inputType = String((event && event.inputType) || "");
+
+          return inputType.indexOf("insertFromPaste") === 0 || inputType.indexOf("insertFromDrop") === 0;
+        }
+
+        blockedEvents.forEach(function (eventName) {
+          document.addEventListener(eventName, preventAction, true);
+        });
+
+        document.addEventListener(
+          "keydown",
+          function (event) {
+            if (isBlockedShortcut(event)) {
+              preventAction(event);
+            }
+          },
+          true
+        );
+
+        document.addEventListener(
+          "beforeinput",
+          function (event) {
+            if (isBlockedInput(event)) {
+              preventAction(event);
+            }
+          },
+          true
+        );
+      })();
+    </script>
+
+    {%- block stylesheets %}
+        {{ encore_entry_link_tags('legacy_free-jqgrid') }}
+        {{ encore_entry_link_tags('legacy_app') }}
+        {{ encore_entry_link_tags('legacy_lp') }}
+        {{ encore_entry_link_tags('legacy_exercise') }}
+        {{ encore_entry_link_tags('legacy_document') }}
+        {{ encore_entry_link_tags('vue') }}
+        {{ encore_entry_link_tags('app') }}
+
+        {% if lp_view is defined %}
+            {{ encore_entry_link_tags('css/scorm') }}
+        {% endif %}
+
+        {{ theme_asset_link_tag('colors.css') }}
+        {# <link rel="stylesheet" href="theme_asset('print.css')" media="print" /> #}
+    {% endblock %}
+
+    {# --- TinyMCE shared base config (load before any TinyMCE usage) --- #}
+    {{ theme_asset_script_tag('tiny-settings.js') }}
+
+    {{ encore_entry_script_tags('legacy_free-jqgrid') }}
+    {{ encore_entry_script_tags('legacy_app') }}
+    {{ encore_entry_script_tags('legacy_lp') }}
+    {{ encore_entry_script_tags('legacy_exercise') }}
+    {{ encore_entry_script_tags('legacy_document') }}
+
+    {# Add third party js libraries that can't be loaded using webpack #}
+    {# <script src="{{ asset('libs/readmore-js/readmore.js') }}"></script> #}
+    {# <script src="{{ url('index') ~ 'build/libs/js-cookie/src/js.cookie.js' }}"></script> #}
+
+    {% if mathjax_enabled %}
+        {% include "@ChamiloCore/MathJax/mathjax_render.html.twig" %}
+    {% endif %}
+
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+
+{% if chamilo_plugin_is_enabled('NoSearchIndex') %}
+    <meta name="robots" content="noindex, nofollow, noarchive" data-plugin="NoSearchIndex">
+{% endif %}
+
+    {# Meta description (SEO) #}
+    {% if meta_description %}
+        <meta name="description" content="{{ meta_description|e('html_attr') }}">
+    {% endif %}
+
+    {# OpenGraph + Twitter tags (only if configured) #}
+    {% if has_tracking_meta %}
+        <meta property="og:url" content="{{ absolute_url(app.request.uri) }}">
+        <meta property="og:type" content="website">
+
+        {% if meta_title %}
+            <meta property="og:title" content="{{ meta_title|e('html_attr') }}">
+        {% endif %}
+
+        {% if meta_description %}
+            <meta property="og:description" content="{{ meta_description|e('html_attr') }}">
+        {% endif %}
+
+        {# OG/Twitter image: prefer absolute URL #}
+        {% if meta_image_path %}
+            {% set meta_image_url = meta_image_path starts with 'http' ? meta_image_path : absolute_url(asset(meta_image_path)) %}
+            <meta property="og:image" content="{{ meta_image_url|e('html_attr') }}">
+            <meta name="twitter:image" content="{{ meta_image_url|e('html_attr') }}">
+        {% endif %}
+
+        {# Twitter/X cards: meta tags remain twitter:* #}
+        {# Keep twitter:card only when tracking meta is enabled (avoid rendering unused tags). #}
+        <meta name="twitter:card" content="summary_large_image">
+
+        {% if meta_title %}
+            <meta name="twitter:title" content="{{ meta_title|e('html_attr') }}">
+        {% endif %}
+
+        {% if meta_description %}
+            <meta name="twitter:description" content="{{ meta_description|e('html_attr') }}">
+        {% endif %}
+
+        {% if meta_twitter_site %}
+            <meta name="twitter:site" content="{{ meta_twitter_site|e('html_attr') }}">
+        {% endif %}
+
+        {% if meta_twitter_creator %}
+            <meta name="twitter:creator" content="{{ meta_twitter_creator|e('html_attr') }}">
+        {% endif %}
+    {% endif %}
+
+    {# Check chamilo_js key in assetic.yml #}
+    {% block javascripts %}
+        {% block chamilo_header_js %}
+            {# Loading legacy js using the $htmlHeadXtra array #}
+            {% autoescape false %}
+                {% for js in legacy_javascript %}
+                    {{~ js }}
+                {% endfor %}
+            {% endautoescape %}
+        {% endblock %}
+    {% endblock %}
+
+    <link rel="manifest" href="/manifest.json">
+
+    {# tracking.header_extra_content: inject raw HTML inside <head> #}
+    {% if header_extra_content %}
+        {{ header_extra_content|raw }}
+    {% endif %}
+</head>

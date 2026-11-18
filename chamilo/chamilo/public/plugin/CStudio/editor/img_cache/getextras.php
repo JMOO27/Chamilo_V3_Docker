@@ -1,0 +1,119 @@
+<?php
+
+declare(strict_types=1);
+
+use Chamilo\CoreBundle\Framework\Container;
+
+/*
+ * This file contains the functions used by the Chamidoc.
+ *
+ * @version 18/05/2024
+ */
+
+require_once __DIR__.'/../../0_dal/dal.global_lib.php';
+
+header('Content-type: text/javascript');
+
+error_reporting(0);
+
+require_once __DIR__.'/../../0_dal/dal.vdatabase.php';
+$VDB = new VirtualDatabase();
+
+require_once __DIR__.'/../../ajax/inc/functions.php';
+
+require_once __DIR__.'/../../0_dal/dal.save.php';
+
+$idPage = -1;
+if (isset($_POST['id'])) {
+    $idPage = (int) $_POST['id'];
+}
+if (isset($_GET['id'])) {
+    $idPage = (int) $_GET['id'];
+}
+
+// Checked before the cache read below: a fresh cache hit used to be served
+// unconditionally, bypassing even the anonymous check that follows it.
+if ($VDB->w_api_is_anonymous() || !oel_ctr_rights($idPage)) {
+    echo 'var baseMyCollImgs = [];';
+
+    exit;
+}
+
+$pluginFileSystem = Container::getPluginsFileSystem();
+$cacheFileRel = 'CStudio/editor/img_cache/tmp/imgextras_'.$idPage.'.json';
+
+try {
+    if ($pluginFileSystem->fileExists($cacheFileRel)) {
+        $cacheContent = $pluginFileSystem->read($cacheFileRel);
+        $lastModified = $pluginFileSystem->lastModified($cacheFileRel);
+
+        if ((time() - $lastModified) < 300) {
+            echo $cacheContent;
+
+            exit;
+        }
+    }
+} catch (\Throwable $exception) {
+    error_log('CStudio getextras cache read failed: '.$exception->getMessage());
+}
+
+if (isset($_POST['id']) || isset($_GET['id'])) {
+    $finalJson = 'var baseMyCollImgs = [';
+
+    $localFolder = get_local_folder($idPage);
+    $courseCacheRel = 'CStudio/editor/img_cache/'.$localFolder;
+
+    $useFilesRel = $courseCacheRel.'/ltf.txt';
+    $colUseFiles = '';
+    if ($pluginFileSystem->fileExists($useFilesRel)) {
+        $colUseFiles = $pluginFileSystem->read($useFilesRel);
+    }
+
+    $ind = 0;
+
+    if ($pluginFileSystem->directoryExists($courseCacheRel)) {
+        foreach ($pluginFileSystem->listContents($courseCacheRel, false) as $item) {
+            if ($item->isFile()) {
+                $file = basename($item->path());
+                if (
+                    false != strpos($file, '.jpg')
+                    || (false != strpos($file, '.png') && !str_contains($file, 'humbnail-studio-'))
+                    || false != strpos($file, '.gif') || false != strpos($file, '.jpeg')
+                    || (false != strpos($file, '.svg') && !str_contains($file, 'schema-'))
+                ) {
+                    $nam = $file;
+                    if (0 != $ind) {
+                        $finalJson .= ',';
+                    }
+                    $namF = $VDB->w_get_path(WEB_PLUGIN_PATH).'CStudio/img-cache.php?path='.rawurlencode(strtolower($localFolder).'/'.$nam);
+                    $finalJson .= '{';
+                    $finalJson .= '"type":"image",';
+                    $finalJson .= '"src":"'.$namF.'",';
+                    if (!str_contains($colUseFiles, $file)) {
+                        $finalJson .= '"usefile":0,';
+                    } else {
+                        $finalJson .= '"usefile":1,';
+                    }
+                    $finalJson .= '"unitDim":"%","height":0,"width":"100%"';
+                    $finalJson .= '}';
+                    $ind++;
+                }
+            }
+        }
+    }
+
+    $finalJson .= '];';
+    echo $finalJson;
+
+    try {
+        $cacheDirRel = 'CStudio/editor/img_cache/tmp';
+
+        if (!$pluginFileSystem->directoryExists($cacheDirRel)) {
+            $pluginFileSystem->createDirectory($cacheDirRel);
+        }
+
+        $pluginFileSystem->write($cacheFileRel, $finalJson);
+    } catch (\Throwable $exception) {
+        error_log('CStudio getextras cache write failed: '.$exception->getMessage());
+    }
+}

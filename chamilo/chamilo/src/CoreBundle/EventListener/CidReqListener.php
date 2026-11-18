@@ -1,0 +1,586 @@
+<?php
+
+/* For licensing terms, see /license.txt */
+
+declare(strict_types=1);
+
+namespace Chamilo\CoreBundle\EventListener;
+
+use Chamilo\CoreBundle\Controller\EditorController;
+use Chamilo\CoreBundle\Entity\Course;
+use Chamilo\CoreBundle\Entity\Session;
+use Chamilo\CoreBundle\Entity\TrackECourseAccess;
+use Chamilo\CoreBundle\Entity\User;
+use Chamilo\CoreBundle\Helpers\CourseFromRequestHelper;
+use Chamilo\CoreBundle\Helpers\RequestExpectsJsonHelper;
+use Chamilo\CoreBundle\Repository\ExtraFieldValuesRepository;
+use Chamilo\CoreBundle\Repository\LegalRepository;
+use Chamilo\CoreBundle\Security\Authorization\Voter\CourseVoter;
+use Chamilo\CoreBundle\Security\Authorization\Voter\GroupVoter;
+use Chamilo\CoreBundle\Security\Authorization\Voter\SessionVoter;
+use Chamilo\CoreBundle\Security\CourseAccessResolver;
+use Chamilo\CoreBundle\Settings\SettingsManager;
+use Chamilo\CourseBundle\Controller\CourseControllerInterface;
+use Chamilo\CourseBundle\Entity\CGroup;
+use ChamiloSession;
+use Doctrine\ORM\EntityManagerInterface;
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Event\ControllerEvent;
+use Symfony\Component\HttpKernel\Event\RequestEvent;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
+use Symfony\Component\Security\Core\Authorization\AuthorizationCheckerInterface;
+use Symfony\Component\Security\Core\User\UserInterface;
+use Symfony\Contracts\Translation\TranslatorInterface;
+use Throwable;
+use Twig\Environment;
+
+/**
+ * Sets the course and session objects in the controller that implements the CourseControllerInterface.
+ */
+class CidReqListener
+{
+    /**
+     * These roles are context roles and must be cleared every request
+     * to avoid "role leakage" between courses/groups/sessions.
+     */
+    private const array CONTEXT_ROLES = [
+        'ROLE_CURRENT_COURSE_GROUP_TEACHER',
+        'ROLE_CURRENT_COURSE_GROUP_STUDENT',
+        'ROLE_CURRENT_COURSE_STUDENT',
+        'ROLE_CURRENT_COURSE_TEACHER',
+        'ROLE_CURRENT_COURSE_SESSION_STUDENT',
+        'ROLE_CURRENT_COURSE_SESSION_TEACHER',
+    ];
+
+    /**
+     * Routes that expose the course id through the {id} route parameter instead of a
+     * cid query param. For these, the course id is read from the route attributes.
+     */
+    private const array ROUTES_WITH_COURSE_ID_PARAM = [
+        'chamilo_core_course_gettoolintro',
+    ];
+
+    public function __construct(
+        private readonly Environment $twig,
+        private readonly AuthorizationCheckerInterface $authorizationChecker,
+        private readonly TranslatorInterface $translator,
+        private readonly EntityManagerInterface $entityManager,
+        private readonly TokenStorageInterface $tokenStorage,
+        private readonly CourseFromRequestHelper $courseFromRequest,
+        private readonly CourseAccessResolver $courseAccessResolver,
+        private readonly SettingsManager $settingsManager,
+        private readonly LegalRepository $legalRepository,
+        private readonly ExtraFieldValuesRepository $extraFieldValuesRepository,
+    ) {}
+
+    /**
+     * Get request from the URL cidReq, c_id or the "ABC" in the courses url (courses/ABC/index.php).
+     */
+    public function onKernelRequest(RequestEvent $event): void
+    {
+        global $cidReset;
+
+        if (!$event->isMainRequest()) {
+            // Do nothing on subrequests
+            return;
+        }
+
+        $request = $event->getRequest();
+
+        // Ignore debug toolbar
+        if ('_wdt' === $request->attributes->get('_route')) {
+            return;
+        }
+
+        // Ignore profiler toolbar
+        if ('_wdt' === $request->attributes->get('_profiler')) {
+            return;
+        }
+
+        // Skip all course/session logic during installation pages.
+        // This prevents crashes when APP_INSTALLED is wrong or the DB is not ready yet.
+        $path = $request->getPathInfo();
+        if (\is_string($path) && str_starts_with($path, '/main/install/')) {
+            return;
+        }
+
+        // Always reset context roles at the beginning of each main request
+        $this->resetContextRolesOnTokenUser();
+
+        if (true === $cidReset) {
+            $this->cleanSessionHandler($request);
+
+            return;
+        }
+
+        // Prevent "Session has not been set" during early bootstrap or install.
+        if (!$request->hasSession()) {
+            // No session available yet, so we cannot safely store course/session context.
+            return;
+        }
+
+        $sessionHandler = $request->getSession();
+        $twig = $this->twig;
+
+        $course = null;
+        $courseInfo = [];
+
+        // Course reference from the URL: cid (id or code) or the legacy 1.11.x cidReq (code).
+        $courseReference = $this->courseFromRequest->getCourseReference($request);
+
+        // Some course routes carry the course id as the {id} route parameter instead of
+        // a cid query param (e.g. chamilo_core_course_gettoolintro). Without this fallback
+        // the listener would find no cid and clear the whole course/session context.
+        if (null === $courseReference && \in_array($request->attributes->get('_route'), self::ROUTES_WITH_COURSE_ID_PARAM, true)) {
+            $routeCourseId = (int) $request->attributes->get('id');
+            if ($routeCourseId > 0) {
+                $courseReference = (string) $routeCourseId;
+            }
+        }
+
+        $checker = $this->authorizationChecker;
+
+        if (null !== $courseReference) {
+            if ($sessionHandler->has('course')) {
+                /** @var Course $courseFromSession */
+                $courseFromSession = $sessionHandler->get('course');
+                if ($courseFromSession instanceof Course
+                    && ($courseReference === (string) $courseFromSession->getId() || $courseReference === $courseFromSession->getCode())
+                ) {
+                    $course = $courseFromSession;
+                    $courseInfo = (array) $sessionHandler->get('_course');
+                }
+            }
+
+            if (null === $course) {
+                $course = $this->courseFromRequest->resolveByReference($courseReference);
+
+                if (null === $course) {
+                    throw new NotFoundHttpException($this->translator->trans('Course does not exist'));
+                }
+
+                $courseInfo = api_get_course_info($course->getCode());
+            }
+
+            // Setting variables in the session.
+            $sessionHandler->set('course', $course);
+            $sessionHandler->set('_real_cid', $course->getId());
+            $sessionHandler->set('cid', $course->getId());
+            $sessionHandler->set('_cid', $course->getCode());
+            $sessionHandler->set('_course', $courseInfo);
+            ChamiloSession::write('cid', $course->getId());
+            ChamiloSession::write('_real_cid', $course->getId());
+            ChamiloSession::write('_course', $courseInfo);
+
+            // Setting variables for the twig templates.
+            $twig->addGlobal('course', $course);
+
+            $ltiAccessRestored = true === $request->attributes->get('_lti_provider_access_restored');
+
+            if ($ltiAccessRestored) {
+                $ltiUserId = (int) $request->attributes->get('_lti_provider_user_id', 0);
+                $ltiCourseId = (int) $request->attributes->get('_lti_provider_course_id', 0);
+
+                if (
+                    $ltiUserId > 0
+                    && $ltiCourseId > 0
+                    && $ltiCourseId === (int) $course->getId()
+                ) {
+                    return;
+                }
+            }
+
+            $sessionId = $this->courseFromRequest->getSessionId($request) ?? 0;
+
+            // The dedicated checkLegal.json endpoint computes redirects itself and
+            // returns them as JSON for the Vue router guard. Direct page requests are
+            // redirected here before the generic course access voter is evaluated.
+            if ('chamilo_core_course_check_legal_json' !== $request->attributes->get('_route')) {
+                $passwordRedirect = $this->redirectForRegistrationPassword($course, $sessionId);
+                if (null !== $passwordRedirect) {
+                    $event->setResponse($passwordRedirect);
+
+                    return;
+                }
+
+                $tokenUser = $this->tokenStorage->getToken()?->getUser();
+                if ($tokenUser instanceof User) {
+                    $termsRedirect = $this->redirectForPendingTermsAndConditions(
+                        $request,
+                        $tokenUser,
+                        $course,
+                        $sessionId
+                    );
+                    if (null !== $termsRedirect) {
+                        $event->setResponse($termsRedirect);
+
+                        return;
+                    }
+                }
+            }
+
+            if (false === $checker->isGranted(CourseVoter::VIEW, $course)) {
+                $this->denyRequest($event, $request, $this->translator->trans("You're not allowed in this course"));
+
+                return;
+            }
+
+            if (empty($sessionId)) {
+                $sessionHandler->remove('session_name');
+                $sessionHandler->remove('sid');
+                $sessionHandler->remove('session');
+                ChamiloSession::erase('session_name');
+                ChamiloSession::erase('sid');
+                ChamiloSession::erase('session');
+            } else {
+                $session = $this->entityManager->find(Session::class, $sessionId);
+                if (null !== $session) {
+                    $session->setCurrentCourse($course);
+
+                    if (false === $checker->isGranted(SessionVoter::VIEW, $session)) {
+                        $this->denyRequest($event, $request, $this->translator->trans("You're not allowed in this session"));
+
+                        return;
+                    }
+                    $sessionHandler->set('session_name', $session->getTitle());
+                    $sessionHandler->set('sid', $session->getId());
+                    $sessionHandler->set('session', $session);
+                    ChamiloSession::write('sid', $session->getId());
+
+                    $twig->addGlobal('session', $session);
+                } else {
+                    throw new NotFoundHttpException($this->translator->trans('Session not found'));
+                }
+            }
+
+            // Group
+            $groupId = $this->courseFromRequest->getGroupId($request) ?? 0;
+
+            if (empty($groupId)) {
+                $sessionHandler->remove('gid');
+                ChamiloSession::erase('gid');
+            } else {
+                $group = $this->entityManager->getRepository(CGroup::class)->find($groupId);
+
+                if (null === $group) {
+                    throw new NotFoundHttpException($this->translator->trans('Group not found'));
+                }
+
+                $group->setParent($course);
+
+                if (false === $checker->isGranted(GroupVoter::VIEW, $group)) {
+                    $this->denyRequest($event, $request, $this->translator->trans("You're not allowed in this group"));
+
+                    return;
+                }
+
+                $sessionHandler->set('group', $group);
+                $sessionHandler->set('gid', $groupId);
+                ChamiloSession::write('gid', $groupId);
+            }
+
+            $bodyOrigin = $request->request->get('origin');
+            $origin = self::normalizeOrigin(
+                $request->query->get('origin', null !== $bodyOrigin ? (string) $bodyOrigin : null)
+            );
+            if (null !== $origin) {
+                $sessionHandler->set('origin', $origin);
+            } else {
+                $sessionHandler->remove('origin');
+            }
+
+            $courseParams = $this->generateCourseUrl($course, $sessionId, $groupId, $origin);
+            $sessionHandler->set('course_url_params', $courseParams);
+            $twig->addGlobal('course_url_params', $courseParams);
+        } else {
+            $this->cleanSessionHandler($request);
+        }
+    }
+
+    /**
+     * Once the onKernelRequest was fired, we check if the course/session object were set and we inject them in the controller.
+     */
+    public function onKernelController(ControllerEvent $event): void
+    {
+        $controllerList = $event->getController();
+
+        if (!\is_array($controllerList)) {
+            return;
+        }
+
+        $request = $event->getRequest();
+
+        // Prevent "Session has not been set" during early bootstrap or install.
+        if (!$request->hasSession()) {
+            return;
+        }
+
+        // Skip injection during installation pages.
+        $path = $request->getPathInfo();
+        if (\is_string($path) && str_starts_with($path, '/main/install/')) {
+            return;
+        }
+
+        $sessionHandler = $request->getSession();
+
+        $courseReference = $this->courseFromRequest->getCourseReference($request);
+
+        if (\is_array($controllerList)
+            && (
+                $controllerList[0] instanceof CourseControllerInterface
+                || $controllerList[0] instanceof EditorController
+            )
+        ) {
+            if (null !== $courseReference) {
+                $controller = $controllerList[0];
+                $session = $sessionHandler->get('session');
+                $course = $sessionHandler->get('course');
+
+                if ($course) {
+                    $controller->setCourse($course);
+                }
+
+                if ($session) {
+                    $controller->setSession($session);
+                }
+            }
+        }
+    }
+
+    public function cleanSessionHandler(Request $request): void
+    {
+        // If there is no session available, just ensure we clear context roles and exit.
+        if (!$request->hasSession()) {
+            $this->resetContextRolesOnTokenUser();
+
+            return;
+        }
+
+        $sessionHandler = $request->getSession();
+        $alreadyVisited = $sessionHandler->get('course_already_visited');
+        if ($alreadyVisited) {
+            // "Logout" course
+            $sessionHandler->remove('course_already_visited');
+            ChamiloSession::erase('course_already_visited');
+        }
+
+        $courseId = (int) $sessionHandler->get('cid', 0);
+        $sessionId = (int) $sessionHandler->get('sid', 0);
+        $ip = (string) ($request->getClientIp() ?? '');
+
+        // Track course logout only when we have a valid course context and a valid Chamilo User entity.
+        if (0 !== $courseId) {
+            $token = $this->tokenStorage->getToken();
+            if (null !== $token) {
+                $tokenUser = $token->getUser();
+
+                // The token user might be a string (e.g., "anon.") or another UserInterface implementation.
+                // We must only log access when it is the Doctrine-backed Chamilo User entity with a valid ID.
+                if ($tokenUser instanceof User && (int) $tokenUser->getId() > 0) {
+                    try {
+                        $this->entityManager
+                            ->getRepository(TrackECourseAccess::class)
+                            ->logoutAccess($tokenUser, $courseId, $sessionId, $ip)
+                        ;
+                    } catch (Throwable) {
+                        // Tracking must never break the current request.
+                    }
+                }
+            }
+        }
+
+        $sessionHandler->remove('toolgroup');
+        $sessionHandler->remove('_cid');
+        $sessionHandler->remove('cid');
+        $sessionHandler->remove('sid');
+        $sessionHandler->remove('gid');
+        $sessionHandler->remove('is_allowed_in_course');
+        $sessionHandler->remove('_real_cid');
+        $sessionHandler->remove('_course');
+        $sessionHandler->remove('_locale_course');
+        $sessionHandler->remove('course');
+        $sessionHandler->remove('session');
+        $sessionHandler->remove('course_url_params');
+        $sessionHandler->remove('origin');
+
+        ChamiloSession::erase('toolgroup');
+        ChamiloSession::erase('_cid');
+        ChamiloSession::erase('cid');
+        ChamiloSession::erase('sid');
+        ChamiloSession::erase('gid');
+        ChamiloSession::erase('is_allowed_in_course');
+        ChamiloSession::erase('_real_cid');
+        ChamiloSession::erase('_course');
+        ChamiloSession::erase('_locale_course');
+        ChamiloSession::erase('course');
+        ChamiloSession::erase('session');
+        ChamiloSession::erase('course_url_params');
+        ChamiloSession::erase('origin');
+
+        // Remove context roles also when leaving the course/session/group
+        $this->resetContextRolesOnTokenUser();
+    }
+
+    /**
+     * Redirects a visitor to the course password form before the modern course
+     * home or one of its tools is rendered.
+     */
+    private function redirectForRegistrationPassword(Course $course, int $sessionId): ?RedirectResponse
+    {
+        if (true === (bool) ChamiloSession::read('course_password_'.$course->getId(), false)) {
+            return null;
+        }
+
+        $tokenUser = $this->tokenStorage->getToken()?->getUser();
+        $user = $tokenUser instanceof User ? $tokenUser : null;
+        $session = $sessionId > 0 ? $this->entityManager->find(Session::class, $sessionId) : null;
+
+        if (!$this->courseAccessResolver->requiresRegistrationPassword($course, $user, $session)) {
+            return null;
+        }
+
+        return new RedirectResponse(
+            '/main/auth/set_temp_password.php?'.http_build_query([
+                'course_id' => $course->getId(),
+                'session_id' => $sessionId,
+            ])
+        );
+    }
+
+    /**
+     * Mirrors CourseController::checkTermsAndConditionJson() so that a direct page
+     * load of a course also redirects a student with pending terms to tc.php,
+     * instead of falling through to the CourseVoter::VIEW access check.
+     */
+    private function redirectForPendingTermsAndConditions(
+        Request $request,
+        User $user,
+        Course $course,
+        int $sessionId
+    ): ?RedirectResponse {
+        if (!$user->isStudent()
+            || 'true' !== $this->settingsManager->getSetting('registration.allow_terms_conditions', true)
+            || 'course' !== $this->settingsManager->getSetting('workflows.load_term_conditions_section', true)
+        ) {
+            return null;
+        }
+
+        $termAndConditionStatus = false;
+        $extraValue = $this->extraFieldValuesRepository->findLegalAcceptByItemId($user->getId());
+        if (!empty($extraValue['value'])) {
+            $userConditions = explode(':', $extraValue['value']);
+            $version = $userConditions[0];
+            $langId = (int) ($userConditions[1] ?? 0);
+            $realVersion = $this->legalRepository->getLastVersion($langId);
+            $termAndConditionStatus = ($version >= $realVersion);
+        }
+
+        if ($termAndConditionStatus) {
+            $request->getSession()->remove('term_and_condition');
+
+            return null;
+        }
+
+        $request->getSession()->set('term_and_condition', ['user_id' => $user->getId()]);
+
+        if ('true' === $this->settingsManager->getSetting('course.allow_public_course_with_no_terms_conditions', true)
+            && Course::OPEN_WORLD === $course->getVisibility()
+        ) {
+            return null;
+        }
+
+        if ($this->authorizationChecker->isGranted('ROLE_ADMIN')) {
+            return null;
+        }
+
+        $request->getSession()->remove('cid');
+        $request->getSession()->remove('course');
+
+        $returnUrl = '/course/'.$course->getId().'/home'.($sessionId > 0 ? '?sid='.$sessionId : '');
+
+        return new RedirectResponse('/main/auth/tc.php?return='.urlencode($returnUrl));
+    }
+
+    private function denyRequest(RequestEvent $event, Request $request, string $message): void
+    {
+        if (RequestExpectsJsonHelper::expectsJson($request)) {
+            $event->setResponse(new JsonResponse([
+                'error' => 'access_denied',
+                'message' => $message,
+            ], Response::HTTP_FORBIDDEN));
+
+            return;
+        }
+
+        throw new AccessDeniedHttpException($message);
+    }
+
+    private function resetContextRolesOnTokenUser(): void
+    {
+        $token = $this->tokenStorage->getToken();
+        if (null === $token) {
+            return;
+        }
+
+        $user = $token->getUser();
+        if (!$user instanceof UserInterface) {
+            return;
+        }
+
+        // We only know removeRole exists on Chamilo User entity
+        if ($user instanceof User) {
+            foreach (self::CONTEXT_ROLES as $role) {
+                $user->removeRole($role);
+            }
+            $token->setUser($user);
+        }
+    }
+
+    private static function normalizeOrigin(mixed $origin): ?string
+    {
+        if (\is_array($origin)) {
+            foreach ($origin as $value) {
+                $normalizedOrigin = self::normalizeOrigin($value);
+                if (null !== $normalizedOrigin) {
+                    return $normalizedOrigin;
+                }
+            }
+
+            return null;
+        }
+
+        if (!\is_scalar($origin)) {
+            return null;
+        }
+
+        $origin = trim((string) $origin);
+
+        if ('' === $origin) {
+            return null;
+        }
+
+        return $origin;
+    }
+
+    private function generateCourseUrl(?Course $course, int $sessionId, int $groupId, ?string $origin): string
+    {
+        if (null !== $course) {
+            $cidReqURL = '&cid='.$course->getId();
+            $cidReqURL .= '&sid='.$sessionId;
+            $cidReqURL .= '&gid='.$groupId;
+
+            if (null !== $origin) {
+                $cidReqURL .= '&origin='.urlencode($origin);
+            }
+
+            return $cidReqURL;
+        }
+
+        return '';
+    }
+}

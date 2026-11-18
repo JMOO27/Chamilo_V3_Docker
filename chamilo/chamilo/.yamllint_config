@@ -1,0 +1,10 @@
+ignore: |
+    assets/*
+    .travis.yml
+    public/libs/*
+    public/plugin/Test2Pdf/*
+
+extends: default
+rules:
+  line-length:
+    max: 500

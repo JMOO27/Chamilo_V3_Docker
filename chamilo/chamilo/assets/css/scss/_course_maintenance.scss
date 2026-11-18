@@ -1,0 +1,9 @@
+
+.cm-root { width: 100%; }
+:host, .cm-root { overflow-x: hidden; }
+.cm-layout {
+  .chk-success { accent-color: rgb(var(--color-success-base)); }
+  .opacity-60:hover { opacity: .85; }
+  .link {color: #0ea5e9;text-decoration: none;cursor: pointer;}
+  .link:hover {text-decoration: underline;}
+}
